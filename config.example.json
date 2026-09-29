@@ -1,0 +1,21 @@
+{
+  "tenant_id": null,
+  "client_id": null,
+  "client_secret_env": null,
+  "authority_url": null,
+  "graph_url": null,
+  "sqlite_path": null,
+  "backup_root": null,
+  "mount_marker_name": null,
+  "mount_marker_value": null,
+  "backup_interval_seconds": null,
+  "minimum_free_bytes": null,
+  "max_attempts": null,
+  "retry_base_seconds": null,
+  "http_timeout_seconds": null,
+  "max_http_attempts": null,
+  "retention_policy": null,
+  "retention_days": null,
+  "special_item_policy": null,
+  "guest_account_policy": null
+}
