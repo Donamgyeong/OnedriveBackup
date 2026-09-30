@@ -8,6 +8,7 @@ from .db import encode
 from .graph import GraphError, segment
 from .storage import StorageError, digest
 from .retention import Retention
+from .browse import BrowsePublisher
 
 
 log = logging.getLogger(__name__)
@@ -270,6 +271,7 @@ class Engine:
             run_id = conn.execute("INSERT INTO runs(started,status) VALUES (?,'running')", (time.time(),)).lastrowid
         errors, fatal = 0, False
         retention = {"completed": 0, "failed": 0}
+        browse = {"published": 0, "failed": 0}
         try:
             retention = Retention(self.config, self.db, self.storage).prune()
             errors += retention["failed"]
@@ -283,6 +285,8 @@ class Engine:
                     log.error("변경 조회 실패 drive=%s type=%s", drive["drive_id"], type(exc).__name__)
             self.repair_missing()
             self.process_jobs()
+            browse = BrowsePublisher(self.config, self.db, self.storage).sync()
+            errors += browse["failed"]
         except (GraphError, StorageError, OSError, ValueError, KeyError) as exc:
             fatal = True
             log.error("실행 실패 type=%s", type(exc).__name__)
@@ -313,4 +317,5 @@ class Engine:
                     conn.execute("UPDATE runs SET status='partial' WHERE run_id=?", (run_id,))
         return {"run_id": run_id, "status": status, "remaining_jobs": remaining,
                 "retention": retention,
+                "browse": browse,
                 "verification": "mount_readback_only"}

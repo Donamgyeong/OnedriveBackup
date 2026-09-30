@@ -48,6 +48,10 @@ python -m onedrive_backup --config config.json retry-failed
 # 현재 파일 해시 점검 및 복구 작업 등록; 실제 다운로드는 다음 run에서 수행
 python -m onedrive_backup --config config.json verify
 
+# 기존 백업을 탐색기에서 열 수 있도록 최신 파일 보기 생성/갱신
+# OneDrive 재다운로드나 인증 없이 저장된 백업에서 복사한다.
+python -m onedrive_backup --config config.json browse
+
 # 기간 만료 대상 확인 / 폐기 실행 (Graph 인증 없이 실행 가능)
 python -m onedrive_backup --config config.json prune --dry-run
 python -m onedrive_backup --config config.json prune
@@ -74,12 +78,24 @@ python -m onedrive_backup --config config.json restore --object-id <OBJECT_ID> -
 ```text
 <backup_root>/
   <mount_marker_name>
+  browse/<계정명__ID>/drive_<ID>/current/<원본폴더__ID>/<원본파일명.확장자>
+  browse/<계정명__ID>/drive_<ID>/deleted/<원본폴더__ID>/<원본파일명.확장자>
   objects/<prefix>/<object_id>.bin   # 불변 파일 내용
   manifests/<object_id>.json        # 원래 이름, 경로, 태그, 해시, 식별자
   catalogs/<run-id>-<uuid>.sqlite    # 실행별 SQLite backup API 스냅샷
 ```
 
-원본 폴더를 그대로 복제하는 대신 ID 기반 버전 저장 방식을 구현했다. 따라서 파일 탐색기에서 원래 이름으로 직접 열람하는 미러 기능은 없다. `list`와 `restore`로 파일을 찾고 원래 이름의 파일로 내보낼 수 있다. `list`의 경로는 최신 관측 경로이며, 최초 저장 당시 경로는 버전별 manifest에 남는다. 이후 이름 변경은 DB 스냅샷에 보존된다.
+`browse`는 탐색기에서 원래 파일명과 확장자로 직접 열 수 있는 최신 백업 복사본이다. `run`/`serve`는 백업 처리 후 자동으로 갱신한다. 이미 저장된 `.bin` 백업도 `browse` 명령 또는 다음 백업 실행에서 변환해 보여 주며, 기존 버전 저장소를 이동하거나 삭제하지 않는다. 과거 버전은 기존 `list`와 `restore`로 조회·복원한다.
+
+계정별·드라이브별로 구분하고 원본 폴더 계층을 따른다. 계정과 폴더에는 충돌 방지를 위한 짧은 ID를 붙인다. 일반 파일명과 확장자는 유지하며, 대소문자 충돌·금지 문자·예약어·너무 긴 이름에는 ID를 붙이거나 길이를 줄인다. 매우 긴 전체 경로는 `browse/_long_paths/<계정ID>/<드라이브ID>/<파일ID>/<파일명>`에 배치한다. 원래 경로는 DB와 manifest에 남는다.
+
+OneDrive에서 이름·폴더가 바뀌면 다음 실행에서 새 위치에 복사본을 만든 후 이전 위치의 프로그램 소유 복사본을 정리한다. 원본에서 삭제된 파일은 `deleted` 아래로 이동하여 마지막 백업을 계속 열람할 수 있다. 새로운 내용 백업이 실패하면 이전에 성공한 백업 내용이 표시된다. 비어 있는 폴더와 이동 후 빈 폴더는 별도 정리하지 않는다.
+
+복사 방식이므로 최신 파일 전체 용량만큼 추가 공간이 필요하며, 갱신 중에는 임시 파일 공간도 필요하다. 복사본은 열람용으로 사용한다. 사용자가 내용을 수정한 파일이나 프로그램이 관리하지 않는 기존 파일은 덮어쓰거나 삭제하지 않고 충돌로 기록한다. 수정본을 다른 경로로 옮긴 뒤 `browse`를 다시 실행하면 정상 복사본을 만들 수 있다. 문서 중앙화 솔루션의 접근 권한으로 읽기 전용 열람을 설정할 수 있다.
+
+검증된 임시 복사본을 최종 파일명으로 바꾸므로 마운트가 같은 폴더 내 `os.replace`를 지원해야 한다. 교체 실패나 파일 잠금은 부분 실패로 보고하고 다음 실행에서 재개한다. 임시 파일은 `.backup-<ID>.partial` 형식이며 일반 문서 이름으로 게시하지 않는다. 보기 갱신·이전 경로 정리가 끝나기 전에는 연결된 백업 버전의 폐기를 보류한다.
+
+`list`의 경로는 최신 관측 경로이며, 최초 저장 당시 경로는 버전별 manifest에 남는다. 이후 이름 변경은 DB 스냅샷에 보존된다.
 
 현재 백업의 파일 유실 및 크기 차이는 매 실행 시 검사한다. 동일 크기 손상은 `verify`에서 감지한다. 이전 버전 전체에 대한 주기적 해시 점검은 별도 구현 대상이다.
 

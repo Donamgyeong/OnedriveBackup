@@ -14,6 +14,7 @@ from onedrive_backup.engine import Engine
 from onedrive_backup.graph import GraphClient, GraphError
 from onedrive_backup.storage import ProcessLock, Storage, StorageError
 from onedrive_backup.retention import Retention
+from onedrive_backup.browse import BrowsePublisher, safe_name
 
 
 def file_item(tag="v1", name="document.txt"):
@@ -240,6 +241,8 @@ class BackupTest(unittest.TestCase):
         with patch.object(self.graph, "pages", side_effect=pages, create=True):
             report = self.engine.run()
         self.assertEqual(report["status"], "success")
+        self.assertEqual(report["browse"]["published"], 1)
+        self.assertEqual(self.view_path().read_bytes(), b"hello")
         self.assertEqual(len(list((self.mount / "catalogs").glob("*.sqlite"))), 1)
 
     def test_restart_recovers_running_jobs(self):
@@ -398,7 +401,7 @@ class BackupTest(unittest.TestCase):
         self.first_backup()
         self.second_backup()
         self.age_objects()
-        object_id = self.db.one("SELECT object_id FROM objects")[0]
+        object_id = self.db.one("SELECT object_id FROM objects WHERE object_id NOT IN (SELECT object_id FROM items WHERE object_id IS NOT NULL)")[0]
         with patch.object(self.storage, "remove", side_effect=PermissionError("locked")):
             self.retention().prune(now=86500)
         args = argparse.Namespace(command="restore", object_id=object_id,
@@ -469,6 +472,136 @@ class BackupTest(unittest.TestCase):
             conn.execute("UPDATE items SET object_id=NULL")
         self.engine.repair_missing()
         self.assertEqual(self.db.one("SELECT error FROM jobs")[0], "source_deleted_no_backup")
+
+    def browse(self):
+        return BrowsePublisher(self.cfg, self.db, self.storage)
+
+    def view_path(self, item_id="file1"):
+        return self.storage.path(self.db.one("SELECT relative_path FROM browse_files WHERE item_id=?", (item_id,))[0])
+
+    def test_browse_existing_backup_is_readable_without_graph(self):
+        self.first_backup()
+        before = self.graph.download_count
+        result = self.browse().sync()
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(self.view_path().name, "document.txt")
+        self.assertEqual(self.view_path().read_bytes(), b"hello")
+        self.assertEqual(self.graph.download_count, before)
+        self.assertEqual(self.browse().sync()["published"], 0)
+
+    def test_browse_update_keeps_version_objects(self):
+        self.first_backup()
+        self.browse().sync()
+        self.graph.current = file_item("v2")
+        self.scan([self.graph.current])
+        with patch.object(self.graph, "download", return_value=io.BytesIO(b"world")):
+            self.engine.process_jobs()
+        self.assertEqual(self.browse().sync()["failed"], 0)
+        self.assertEqual(self.view_path().read_bytes(), b"world")
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM objects")[0], 2)
+
+    def test_browse_rename_and_deleted_keep_readable_copy(self):
+        self.first_backup()
+        self.browse().sync()
+        previous = self.view_path()
+        self.scan([file_item(name="보고서.txt")])
+        self.assertEqual(self.browse().sync()["failed"], 0)
+        self.assertEqual(self.view_path().name, "보고서.txt")
+        self.assertFalse(previous.exists())
+        renamed = self.view_path()
+        self.scan([{"id": "file1", "deleted": {}}])
+        self.assertEqual(self.browse().sync()["failed"], 0)
+        self.assertIn("deleted", self.view_path().parts)
+        self.assertFalse(renamed.exists())
+        self.assertEqual(self.view_path().read_bytes(), b"hello")
+        self.assertEqual(self.graph.download_count, 1)
+
+    def test_browse_parent_rename_refreshes_descendant_path(self):
+        folder = {"id": "folder", "name": "계약", "folder": {}, "parentReference": {"id": "root1"}}
+        self.graph.current = file_item()
+        self.graph.current["parentReference"] = {"id": "folder"}
+        self.scan([ROOT, folder, self.graph.current])
+        self.engine.process_jobs()
+        self.browse().sync()
+        previous = self.view_path()
+        self.scan([{**folder, "name": "계약서"}])
+        self.browse().sync()
+        self.assertTrue(self.view_path().parent.name.startswith("계약서__"))
+        self.assertFalse(previous.exists())
+        self.assertEqual(self.graph.download_count, 1)
+
+    def test_browse_user_edit_is_preserved(self):
+        self.first_backup()
+        self.browse().sync()
+        self.view_path().write_bytes(b"my edits")
+        self.second_backup()
+        self.assertEqual(self.browse().sync()["failed"], 1)
+        self.assertEqual(self.view_path().read_bytes(), b"my edits")
+        original = self.db.one("SELECT o.* FROM items i JOIN objects o ON i.object_id=o.object_id")
+        self.assertEqual(self.storage.path(original["relative_path"]).read_bytes(), b"hello")
+
+    def test_browse_failed_publish_can_resume_without_downloading(self):
+        self.first_backup()
+        with patch("onedrive_backup.browse.os.replace", side_effect=PermissionError("locked")):
+            self.assertEqual(self.browse().sync()["failed"], 1)
+        self.assertIsNotNone(self.db.one("SELECT pending FROM browse_files")[0])
+        self.assertEqual(self.browse().sync()["failed"], 0)
+        self.assertEqual(self.view_path().read_bytes(), b"hello")
+        self.assertEqual(self.graph.download_count, 1)
+        self.assertFalse(list((self.mount / "browse").rglob("*.partial")))
+
+    def test_browse_no_partial_file_at_original_name(self):
+        self.first_backup()
+        with patch("onedrive_backup.browse.shutil.copyfileobj", side_effect=OSError("interrupted")):
+            self.assertEqual(self.browse().sync()["failed"], 1)
+        pending = json.loads(self.db.one("SELECT pending FROM browse_files")[0])
+        self.assertFalse(self.storage.path(pending["path"]).exists())
+        self.assertEqual(self.browse().sync()["failed"], 0)
+
+    def test_browse_case_collision_preserves_both_files(self):
+        self.first_backup()
+        other = {**file_item(), "id": "file2", "name": "DOCUMENT.txt"}
+        self.graph.current = other
+        self.scan([other])
+        self.engine.process_jobs()
+        self.assertEqual(self.browse().sync()["failed"], 0)
+        self.assertNotEqual(str(self.view_path()).casefold(), str(self.view_path("file2")).casefold())
+        self.assertEqual(self.view_path("file2").suffix, ".txt")
+
+    def test_browse_invalid_names_and_long_paths(self):
+        self.assertTrue(safe_name("CON.txt", "id").startswith("_CON"))
+        self.assertNotIn("/", safe_name("../secret.docx", "id"))
+        self.assertTrue(safe_name("a" * 200 + ".docx", "id").endswith(".docx"))
+        self.first_backup()
+        parent = "root1"
+        folders = []
+        for index in range(8):
+            folder = {"id": f"folder{index}", "name": "긴폴더이름" * 6, "folder": {}, "parentReference": {"id": parent}}
+            folders.append(folder)
+            parent = folder["id"]
+        self.scan(folders + [{**file_item(), "parentReference": {"id": parent}}])
+        self.assertEqual(self.browse().sync()["failed"], 0)
+        self.assertIn("_long_paths", self.view_path().parts)
+
+    def test_browse_blocks_unknown_destination_and_outside_path(self):
+        self.first_backup()
+        row = self.db.one("SELECT o.*,i.payload AS source_payload,i.deleted FROM objects o JOIN items i ON i.object_id=o.object_id")
+        target = self.storage.path(self.browse().destination(row))
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"unmanaged")
+        self.assertEqual(self.browse().sync()["failed"], 1)
+        self.assertEqual(target.read_bytes(), b"unmanaged")
+        with self.assertRaises(StorageError):
+            self.browse().path("browse/../objects/important.bin")
+
+    def test_browse_failed_update_protects_visible_old_version_from_prune(self):
+        self.first_backup()
+        self.browse().sync()
+        self.age_objects()
+        self.second_backup()
+        self.assertEqual(self.retention().prune(now=86500)["completed"], 0)
+        self.browse().sync()
+        self.assertEqual(self.retention().prune(now=86500)["completed"], 1)
 
 
 if __name__ == "__main__":

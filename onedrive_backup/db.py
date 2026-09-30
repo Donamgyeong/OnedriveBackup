@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS purge_jobs (
  resource_id TEXT PRIMARY KEY, kind TEXT NOT NULL, relative_path TEXT NOT NULL,
  manifest_path TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
  requested REAL NOT NULL, completed REAL, error TEXT);
+CREATE TABLE IF NOT EXISTS browse_files (
+ drive_id TEXT NOT NULL, item_id TEXT NOT NULL, relative_path TEXT,
+ object_id TEXT, sha256 TEXT, pending TEXT, error TEXT,
+ PRIMARY KEY(drive_id,item_id));
+CREATE TABLE IF NOT EXISTS browse_cleanup (
+ relative_path TEXT PRIMARY KEY, object_id TEXT NOT NULL, sha256 TEXT NOT NULL);
 """
 
 

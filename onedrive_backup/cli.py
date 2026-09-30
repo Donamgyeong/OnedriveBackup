@@ -13,6 +13,7 @@ from .engine import Engine
 from .graph import GraphClient
 from .storage import ProcessLock, Storage, StorageError, digest
 from .retention import Retention
+from .browse import BrowsePublisher
 
 
 def parser():
@@ -25,6 +26,7 @@ def parser():
     commands.add_parser("status", help="최근 실행과 작업 상태")
     commands.add_parser("retry-failed", help="실패 작업을 재시도 대기로 전환")
     commands.add_parser("verify", help="현재 백업 파일의 해시 검사 및 복구 작업 등록")
+    commands.add_parser("browse", help="기존 백업으로 탐색기용 최신 파일 보기 생성·갱신")
     prune = commands.add_parser("prune", help="보존 기간이 지난 백업 폐기")
     prune.add_argument("--dry-run", action="store_true", help="대상만 조회하고 삭제하지 않음")
     listing = commands.add_parser("list", help="백업 버전 목록")
@@ -52,6 +54,8 @@ def execute(args, cfg, db, storage):
                           "accounts": [dict(r) for r in db.all("SELECT status,COUNT(*) AS count FROM accounts GROUP BY status")],
                           "retention": [dict(r) for r in db.all("SELECT state,COUNT(*) AS count FROM purge_jobs GROUP BY state")],
                           "expired_items": db.one("SELECT COUNT(*) AS count FROM expired_items")["count"],
+                          "browse_errors": [dict(r) for r in db.all("SELECT drive_id,item_id,error FROM browse_files WHERE error IS NOT NULL")],
+                          "browse_cleanup_pending": db.one("SELECT COUNT(*) AS count FROM browse_cleanup")["count"],
                           "drives": [dict(r) for r in db.all("SELECT drive_id,status,last_scan,last_backup FROM drives")]}, ensure_ascii=False, indent=2))
     elif args.command == "retry-failed":
         with db.transaction() as conn:
@@ -61,6 +65,10 @@ def execute(args, cfg, db, storage):
         print(json.dumps({"queued": count}))
     elif args.command == "verify":
         print(json.dumps({"repair_jobs": engine.repair_missing(verify_hash=True)}))
+    elif args.command == "browse":
+        report = BrowsePublisher(cfg, db, storage).sync()
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1 if report["failed"] else 0
     elif args.command == "prune":
         report = Retention(cfg, db, storage).prune(dry_run=args.dry_run)
         print(json.dumps(report, ensure_ascii=False, indent=2))

@@ -40,6 +40,13 @@ class Retention:
                 protected.update(row["object_id"] for row in rows)
         # The current pointer is also protected if imported timestamps are out of order.
         protected.update(r["object_id"] for r in self.db.all("SELECT object_id FROM items WHERE object_id IS NOT NULL"))
+        # Keep source versions while a visible copy is current or an update/cleanup is unfinished.
+        for entry in self.db.all("SELECT object_id,pending FROM browse_files"):
+            if entry["object_id"]:
+                protected.add(entry["object_id"])
+            if entry["pending"]:
+                protected.add(json.loads(entry["pending"])["object_id"])
+        protected.update(r["object_id"] for r in self.db.all("SELECT object_id FROM browse_cleanup"))
         return protected
 
     def candidates(self, now):
