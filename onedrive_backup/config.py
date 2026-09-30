@@ -57,8 +57,11 @@ class Config:
         for key in ("sqlite_path", "backup_root"):
             if not Path(raw[key]).is_absolute():
                 raise ConfigError(f"{key}: 절대 경로가 필요합니다")
+        sqlite_path = Path(raw["sqlite_path"])
+        if sqlite_path.exists() and sqlite_path.is_dir():
+            raise ConfigError("sqlite_path: 폴더가 아니라 SQLite 파일 경로가 필요합니다 (예: C:\\backup-state\\backup.sqlite)")
         root = Path(raw["backup_root"]).resolve()
-        if Path(raw["sqlite_path"]).resolve().is_relative_to(root):
+        if sqlite_path.resolve().is_relative_to(root):
             raise ConfigError("SQLite는 백업 마운트 외부의 실제 로컬 디스크에 두세요")
         marker = raw["mount_marker_name"]
         if marker in (".", "..") or any(c in marker for c in '/\\:'):

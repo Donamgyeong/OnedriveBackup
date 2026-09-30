@@ -181,6 +181,14 @@ class BackupTest(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "미설정"):
             Config.load(path)
 
+    def test_config_rejects_directory_as_sqlite_path(self):
+        path = Path(self.temp.name) / "config.json"
+        values = asdict(self.cfg)
+        values["sqlite_path"] = self.temp.name
+        path.write_text(json.dumps(values), encoding="utf-8")
+        with self.assertRaisesRegex(ConfigError, "SQLite 파일 경로"):
+            Config.load(path)
+
     def test_untrusted_delta_link_cannot_receive_credentials(self):
         with self.assertRaises(GraphError):
             GraphClient(self.cfg).get("https://attacker.invalid/v1.0/users")

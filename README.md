@@ -17,7 +17,7 @@ python -m onedrive_backup --config config.json validate
 | client_secret_env | 클라이언트 비밀값이 들어 있는 **환경 변수 이름** |
 | authority_url | 해당 클라우드의 인증 기본 URL; 공용 클라우드 예: `https://login.microsoftonline.com` |
 | graph_url | Graph v1.0 기본 URL; 공용 클라우드 예: `https://graph.microsoft.com/v1.0` |
-| sqlite_path | 실제 로컬 디스크의 SQLite 절대 파일 경로 |
+| sqlite_path | 실제 로컬 디스크의 SQLite 절대 **파일** 경로. 예: `C:\\backup-state\\backup.sqlite` (폴더 경로는 사용할 수 없음) |
 | backup_root | 미리 마운트되어 있는 대상의 절대 경로 |
 | mount_marker_name / mount_marker_value | 대상 루트에 미리 준비한 UTF-8 식별 파일의 이름 / 내용 |
 | backup_interval_seconds | 반복 실행 완료 후 다음 실행까지 대기할 초 |
