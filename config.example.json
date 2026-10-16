@@ -16,6 +16,7 @@
   "max_http_attempts": null,
   "download_concurrency": 4,
   "download_chunk_bytes": 8388608,
+  "repair_check_batch_size": 10000,
   "retention_policy": null,
   "retention_days": null,
   "special_item_policy": null,

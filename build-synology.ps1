@@ -7,7 +7,7 @@ $buildRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot "build\synology"))
 $allowedBuildRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot "build"))
 $stageRoot = Join-Path $buildRoot "OneDriveBackup"
 $distRoot = Join-Path $projectRoot "dist"
-$releaseFile = "OneDriveBackup-0.6.1-synology-source.zip"
+$releaseFile = "OneDriveBackup-0.10.0-synology-source.zip"
 $zipPath = Join-Path $distRoot $releaseFile
 
 if (-not $buildRoot.StartsWith($allowedBuildRoot + [IO.Path]::DirectorySeparatorChar,

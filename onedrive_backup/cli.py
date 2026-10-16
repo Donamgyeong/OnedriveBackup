@@ -53,6 +53,8 @@ def execute(args, cfg, db, storage):
         print(json.dumps({"runs": [dict(r) for r in db.all("SELECT * FROM runs ORDER BY run_id DESC LIMIT 10")],
                           "jobs": [dict(r) for r in db.all("SELECT state,COUNT(*) AS count FROM jobs GROUP BY state")],
                           "accounts": [dict(r) for r in db.all("SELECT status,COUNT(*) AS count FROM accounts GROUP BY status")],
+                          "sites": [dict(r) for r in db.all("SELECT site_id,status,seen FROM sites")],
+                          "site_drives": [dict(r) for r in db.all("SELECT drive_id,site_id FROM site_drives")],
                           "retention": [dict(r) for r in db.all("SELECT state,COUNT(*) AS count FROM purge_jobs GROUP BY state")],
                           "expired_items": db.one("SELECT COUNT(*) AS count FROM expired_items")["count"],
                           "browse_errors": [dict(r) for r in db.all("SELECT drive_id,item_id,error FROM browse_files WHERE error IS NOT NULL")],
@@ -65,7 +67,7 @@ def execute(args, cfg, db, storage):
                 AND i.item_id=jobs.item_id AND i.deleted=0)""").rowcount
         print(json.dumps({"queued": count}))
     elif args.command == "verify":
-        print(json.dumps({"repair_jobs": engine.repair_missing(verify_hash=True)}))
+        print(json.dumps({"repair_jobs": engine.repair_missing(verify_hash=True, full_scan=True)}))
     elif args.command == "browse":
         report = BrowsePublisher(cfg, db, storage).sync()
         print(json.dumps(report, ensure_ascii=False, indent=2))

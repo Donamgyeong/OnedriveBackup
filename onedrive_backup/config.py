@@ -34,6 +34,7 @@ class Config:
     retention_days: Optional[int] = None
     download_concurrency: int = 4
     download_chunk_bytes: int = 8 * 1024 * 1024
+    repair_check_batch_size: int = 10000
 
     @classmethod
     def load(cls, path):
@@ -41,7 +42,8 @@ class Config:
         raw.setdefault("retention_days", None)
         raw.setdefault("download_concurrency", 4)
         raw.setdefault("download_chunk_bytes", 8 * 1024 * 1024)
-        optional = {"retention_days", "download_concurrency", "download_chunk_bytes"}
+        raw.setdefault("repair_check_batch_size", 10000)
+        optional = {"retention_days", "download_concurrency", "download_chunk_bytes", "repair_check_batch_size"}
         missing = [key for key in cls.__annotations__ if key not in optional and raw.get(key) in (None, "")]
         if missing:
             raise ConfigError("미설정 필수 항목: " + ", ".join(missing))
@@ -85,6 +87,8 @@ class Config:
             raise ConfigError("download_concurrency: 1 이상 16 이하의 정수가 필요합니다")
         if not 64 * 1024 <= raw["download_chunk_bytes"] <= 64 * 1024 * 1024:
             raise ConfigError("download_chunk_bytes: 65536 이상 67108864 이하의 정수가 필요합니다")
+        if not 1 <= raw["repair_check_batch_size"] <= 100000:
+            raise ConfigError("repair_check_batch_size: 1 이상 100000 이하의 정수가 필요합니다")
         if raw["special_item_policy"] not in ("report", "exclude"):
             raise ConfigError("special_item_policy: report 또는 exclude")
         if raw["guest_account_policy"] not in ("include", "exclude"):

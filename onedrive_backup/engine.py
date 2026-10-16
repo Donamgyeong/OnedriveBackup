@@ -114,8 +114,14 @@ class Engine:
                     last_progress = now
                 excluded = user.get("userType") == "Guest" and self.config.guest_account_policy == "exclude"
                 with self.db.transaction() as conn:
+                    previous = conn.execute("SELECT profile FROM accounts WHERE user_id=?", (user_id,)).fetchone()
+                    profile_changed = bool(previous and previous["profile"] != encode(user))
                     conn.execute("INSERT OR REPLACE INTO accounts VALUES (?,?,?,?)",
                                  (user_id, encode(user), "excluded" if excluded else "active", time.time()))
+                    if profile_changed:
+                        conn.execute("""INSERT OR IGNORE INTO browse_jobs(drive_id,item_id)
+                            SELECT i.drive_id,i.item_id FROM items i JOIN drives d ON d.drive_id=i.drive_id
+                            WHERE d.user_id=? AND i.object_id IS NOT NULL""", (user_id,))
                     conn.execute("UPDATE drives SET status=? WHERE user_id=?",
                                  ("excluded" if excluded else "discovery_pending", user_id))
                 if excluded:
@@ -166,6 +172,84 @@ class Engine:
                  processed, drive_count, excluded_count, no_drive_count, errors)
         return errors
 
+    def discover_sites(self):
+        """Enumerate tenant site collections and subsites, then all libraries."""
+        errors, libraries = 0, 0
+        seen = set()
+        pending = []
+        log.info("SharePoint 사이트 검색 시작")
+        try:
+            for page in self.graph.pages("/sites/getAllSites"):
+                pending.extend(page["value"])
+                log.info("SharePoint 사이트 목록 조회 sites=%s percent=unknown", len(pending))
+        except (GraphError, OSError, ValueError, KeyError) as exc:
+            log.error("SharePoint 전체 사이트 검색 실패 type=%s", str(exc) if isinstance(exc, GraphError) else type(exc).__name__)
+            return 1
+        while pending:
+            site = pending.pop()
+            site_id = site["id"]
+            if site_id in seen:
+                continue
+            seen.add(site_id)
+            with self.db.transaction() as conn:
+                previous = self.db.one("SELECT profile FROM sites WHERE site_id=?", (site_id,))
+                changed = previous and previous["profile"] != encode(site)
+                conn.execute("INSERT OR REPLACE INTO sites VALUES (?,?,'active',?)",
+                             (site_id, encode(site), time.time()))
+                if changed:
+                    conn.execute("""INSERT OR IGNORE INTO browse_jobs SELECT i.drive_id,i.item_id
+                        FROM items i JOIN site_drives s ON s.drive_id=i.drive_id
+                        WHERE s.site_id=? AND i.object_id IS NOT NULL""", (site_id,))
+            try:
+                discovered = []
+                for page in self.graph.pages("/sites/{}/drives".format(segment(site_id))):
+                    discovered.extend(page["value"])
+                with self.db.transaction() as conn:
+                    conn.execute("""UPDATE drives SET status='unavailable' WHERE drive_id IN
+                        (SELECT drive_id FROM site_drives WHERE site_id=?)""", (site_id,))
+                    for drive in discovered:
+                        if drive.get("driveType") != "documentLibrary":
+                            continue
+                        drive_id = drive["id"]
+                        previous = self.db.one("SELECT profile FROM site_drives WHERE drive_id=?", (drive_id,))
+                        if previous and previous["profile"] != encode(drive):
+                            conn.execute("""INSERT OR IGNORE INTO browse_jobs SELECT drive_id,item_id
+                                FROM items WHERE drive_id=? AND object_id IS NOT NULL""", (drive_id,))
+                        conn.execute("INSERT OR REPLACE INTO site_drives VALUES (?,?,?)",
+                                     (drive_id, site_id, encode(drive)))
+                        conn.execute("""INSERT INTO drives(drive_id,user_id,status) VALUES (?,?,'active')
+                            ON CONFLICT(drive_id) DO UPDATE SET status='active'""",
+                                     (drive_id, "site:" + site_id))
+                        libraries += 1
+            except (GraphError, OSError, ValueError, KeyError) as exc:
+                errors += 1
+                with self.db.transaction() as conn:
+                    conn.execute("UPDATE sites SET status='error' WHERE site_id=?", (site_id,))
+                log.error("SharePoint 사이트 검색 실패 site=%s type=%s", site_id,
+                          str(exc) if isinstance(exc, GraphError) else type(exc).__name__)
+            # A failed library query must not prevent discovery of accessible subsites.
+            try:
+                for page in self.graph.pages("/sites/{}/sites".format(segment(site_id))):
+                    pending.extend(page["value"])
+            except (GraphError, OSError, ValueError, KeyError) as exc:
+                errors += 1
+                with self.db.transaction() as conn:
+                    conn.execute("UPDATE sites SET status='error' WHERE site_id=?", (site_id,))
+                log.error("SharePoint 하위 사이트 검색 실패 site=%s type=%s", site_id,
+                          str(exc) if isinstance(exc, GraphError) else type(exc).__name__)
+            log.info("SharePoint 검색 진행 sites=%s libraries=%s errors=%s percent=unknown",
+                     len(seen), libraries, errors)
+        # Partial enumeration must never mark unseen sites or libraries absent.
+        if not errors:
+            with self.db.transaction() as conn:
+                for row in self.db.all("SELECT site_id FROM sites"):
+                    if row["site_id"] not in seen:
+                        conn.execute("UPDATE sites SET status='not_seen' WHERE site_id=?", (row["site_id"],))
+                        conn.execute("""UPDATE drives SET status='site_not_seen' WHERE drive_id IN
+                            (SELECT drive_id FROM site_drives WHERE site_id=?)""", (row["site_id"],))
+        log.info("SharePoint 사이트 검색 완료 sites=%s libraries=%s errors=%s", len(seen), libraries, errors)
+        return errors
+
     def scan(self, drive_id):
         drive = self.db.one("SELECT * FROM drives WHERE drive_id=?", (drive_id,))
         initial_url = f"/drives/{segment(drive_id)}/root/delta"
@@ -211,14 +295,24 @@ class Engine:
     def _finish_scan(self, drive_id, full_scan, delta_link):
         # Called inside one transaction: queued work and delta cursor commit together.
         conn = self.db.conn
+        hierarchy_changes = set()
+        deletion_roots = set()
         if full_scan:
+            missing_rows = conn.execute("""SELECT item_id,payload,object_id FROM items
+                WHERE drive_id=? AND item_id NOT IN
+                (SELECT item_id FROM scan_items WHERE drive_id=?)""", (drive_id, drive_id)).fetchall()
+            deletion_roots.update(r["item_id"] for r in missing_rows)
+            for missing in missing_rows:
+                if missing["object_id"]:
+                    conn.execute("INSERT OR IGNORE INTO browse_jobs VALUES (?,?)", (drive_id, missing["item_id"]))
             conn.execute("""UPDATE items SET deleted=1 WHERE drive_id=? AND item_id NOT IN
                 (SELECT item_id FROM scan_items WHERE drive_id=?)""", (drive_id, drive_id))
         rows = conn.execute("SELECT * FROM scan_items WHERE drive_id=?", (drive_id,)).fetchall()
         existing = {row["item_id"]: row for row in conn.execute("""SELECT
             i.item_id,i.payload,i.deleted,i.object_id,o.payload AS object_payload
-            FROM items i LEFT JOIN objects o ON o.object_id=i.object_id
-            WHERE i.drive_id=?""", (drive_id,)).fetchall()}
+            FROM scan_items s JOIN items i ON i.drive_id=s.drive_id AND i.item_id=s.item_id
+            LEFT JOIN objects o ON o.object_id=i.object_id
+            WHERE s.drive_id=?""", (drive_id,)).fetchall()}
         total = len(rows)
         last_progress = 0.0
         log.info("드라이브 변경 확정 시작 drive=%s items=%s", drive_id, total)
@@ -227,9 +321,20 @@ class Engine:
             old = existing.get(item["id"])
             if kind(item) == "deleted" and old:
                 item = {**json.loads(old["payload"]), **item}
+            encoded_item = encode(item)
+            metadata_changed = not old or old["payload"] != encoded_item or bool(old["deleted"]) != (kind(item) == "deleted")
+            if metadata_changed:
+                old_item = json.loads(old["payload"]) if old else {}
+                if "folder" in item or "folder" in old_item:
+                    if old:
+                        hierarchy_changes.add(item["id"])
+                elif "file" in item or (old and old["object_id"]):
+                    conn.execute("INSERT OR IGNORE INTO browse_jobs VALUES (?,?)", (drive_id, item["id"]))
+            if kind(item) == "deleted":
+                deletion_roots.add(item["id"])
             conn.execute("""INSERT INTO items(drive_id,item_id,payload,deleted) VALUES (?,?,?,?)
                 ON CONFLICT(drive_id,item_id) DO UPDATE SET payload=excluded.payload,deleted=excluded.deleted""",
-                         (drive_id, item["id"], encode(item), int(kind(item) == "deleted")))
+                         (drive_id, item["id"], encoded_item, int(kind(item) == "deleted")))
             if kind(item) == "file":
                 stored_payload = old["object_payload"] if old else None
                 same = (stored_payload and content_tag(item)
@@ -250,20 +355,34 @@ class Engine:
                 log.info("드라이브 변경 확정 진행 drive=%s items=%s/%s percent=%.1f%%",
                          drive_id, index, total, index * 100.0 / total)
                 last_progress = now
-        # Include descendants of deleted folders, even if Graph returns only the folder.
-        deleted = {r["item_id"] for r in self.db.all("SELECT item_id FROM items WHERE drive_id=? AND deleted=1", (drive_id,))}
-        entries = self.db.all("SELECT item_id,payload FROM items WHERE drive_id=? AND deleted=0", (drive_id,))
         children = {}
-        for entry in entries:
-            parent_id = json.loads(entry["payload"]).get("parentReference", {}).get("id")
-            children.setdefault(parent_id, []).append(entry["item_id"])
-        pending_parents = list(deleted)
+        if hierarchy_changes or deletion_roots:
+            entries = self.db.all("SELECT item_id,payload FROM items WHERE drive_id=? AND deleted=0", (drive_id,))
+            for entry in entries:
+                parent_id = json.loads(entry["payload"]).get("parentReference", {}).get("id")
+                children.setdefault(parent_id, []).append(entry["item_id"])
+        # Include descendants when Graph reports only a deleted folder.
+        deleted = set(deletion_roots)
+        pending_parents = list(deletion_roots)
         while pending_parents:
             parent_id = pending_parents.pop()
             for item_id in children.get(parent_id, ()):
                 if item_id not in deleted:
                     deleted.add(item_id)
                     pending_parents.append(item_id)
+        affected = set(hierarchy_changes)
+        pending_parents = list(hierarchy_changes)
+        while pending_parents:
+            parent_id = pending_parents.pop()
+            for item_id in children.get(parent_id, ()):
+                if item_id not in affected:
+                    affected.add(item_id)
+                    pending_parents.append(item_id)
+        if affected:
+            conn.executemany("""INSERT OR IGNORE INTO browse_jobs(drive_id,item_id)
+                SELECT drive_id,item_id FROM items
+                WHERE drive_id=? AND item_id=? AND object_id IS NOT NULL""",
+                             ((drive_id, item_id) for item_id in affected))
         if deleted:
             log.info("삭제 항목 계층 반영 drive=%s items=%s", drive_id, len(deleted))
         for item_id in deleted:
@@ -293,17 +412,44 @@ class Engine:
             item_id = item.get("parentReference", {}).get("id")
         return list(reversed(parts))
 
-    def repair_missing(self, verify_hash=False):
+    def repair_missing(self, verify_hash=False, full_scan=False):
         self.storage.check()
         repaired = 0
+        batch_limit = self.config.repair_check_batch_size
+        limit_clause = "" if full_scan else " LIMIT ?"
+        limit_args = () if full_scan else (batch_limit,)
         missing_rows = self.db.all("""SELECT i.* FROM items i LEFT JOIN objects o ON i.object_id=o.object_id
-            WHERE o.object_id IS NULL""")
-        stored_rows = self.db.all("""SELECT i.drive_id,i.item_id,i.deleted,o.* FROM items i JOIN objects o
+            WHERE o.object_id IS NULL
+            AND instr(i.payload, '"file":') > 0
+            AND NOT EXISTS (SELECT 1 FROM jobs j
+                WHERE j.drive_id=i.drive_id AND j.item_id=i.item_id)
+            ORDER BY i.drive_id,i.item_id""" + limit_clause, limit_args)
+        stored_limit = None if full_scan else max(0, batch_limit - len(missing_rows))
+        cursor_row = self.db.one("SELECT value FROM settings WHERE key='repair_cursor_object_id'")
+        cursor = cursor_row["value"] if cursor_row else ""
+        stored_sql = """SELECT i.drive_id,i.item_id,i.deleted,o.* FROM items i JOIN objects o
             ON i.object_id=o.object_id WHERE NOT EXISTS
-            (SELECT 1 FROM purge_jobs p WHERE p.resource_id=o.object_id AND p.state='pending')""")
+            (SELECT 1 FROM purge_jobs p WHERE p.resource_id=o.object_id AND p.state='pending')
+            AND NOT EXISTS (SELECT 1 FROM jobs j
+                WHERE j.drive_id=i.drive_id AND j.item_id=i.item_id)"""
+        wrapped = False
+        if full_scan:
+            stored_rows = self.db.all(stored_sql + " ORDER BY i.object_id")
+        elif not stored_limit:
+            stored_rows = []
+        else:
+            stored_rows = self.db.all(stored_sql + " AND i.object_id>? ORDER BY i.object_id LIMIT ?",
+                                      (cursor, stored_limit))
+            if len(stored_rows) < stored_limit and cursor:
+                wrapped = True
+                stored_rows += self.db.all(stored_sql + " AND i.object_id<=? ORDER BY i.object_id LIMIT ?",
+                                           (cursor, stored_limit - len(stored_rows)))
         total = len(missing_rows) + len(stored_rows)
         checked = 0
         last_progress = [0.0]
+        log.info("백업 파일 검사 범위 mode=%s batch_limit=%s candidates=%s wrapped=%s",
+                 "full" if full_scan else "incremental", "all" if full_scan else batch_limit,
+                 total, wrapped)
 
         def report_progress():
             now = time.monotonic()
@@ -316,36 +462,48 @@ class Engine:
 
         if not total:
             report_progress()
+        missing_repairs = []
         # Recover files expired by the former policy even when delta has no changes.
         for row in missing_rows:
             item = json.loads(row["payload"])
             if "file" in item and "remoteItem" not in item and "package" not in item:
-                with self.db.transaction():
-                    self.db.queue(row["drive_id"], row["item_id"], reset=False)
-                    if row["deleted"]:
-                        self.db.conn.execute("UPDATE jobs SET state='failed',error='source_deleted_no_backup' WHERE drive_id=? AND item_id=?",
-                                             (row["drive_id"], row["item_id"]))
+                missing_repairs.append(row)
                 repaired += 1
             checked += 1
             report_progress()
-        for row in stored_rows:
+
+        def queue_repairs(rows):
+            for repair_row in rows:
+                self.db.queue(repair_row["drive_id"], repair_row["item_id"], reset=False)
+                if repair_row["deleted"]:
+                    self.db.conn.execute("UPDATE jobs SET state='failed',error='source_deleted_no_backup' WHERE drive_id=? AND item_id=?",
+                                         (repair_row["drive_id"], repair_row["item_id"]))
+
+        if missing_repairs:
+            with self.db.transaction():
+                queue_repairs(missing_repairs)
+
+        checkpoint_repairs = []
+        checkpoint_size = 250
+        for stored_index, row in enumerate(stored_rows, 1):
             exists = self.storage.exists(row["relative_path"], row["size"])
             valid = exists and (not verify_hash or digest(self.storage.path(row["relative_path"])) == row["sha256"])
             if not valid:
-                with self.db.transaction():
-                    self.db.queue(row["drive_id"], row["item_id"], reset=False)
-                    if row["deleted"]:
-                        self.db.conn.execute("UPDATE jobs SET state='failed',error='source_deleted_no_backup' WHERE drive_id=? AND item_id=?",
-                                             (row["drive_id"], row["item_id"]))
+                checkpoint_repairs.append(row)
                 repaired += 1
             checked += 1
             report_progress()
+            if stored_index % checkpoint_size == 0 or stored_index == len(stored_rows):
+                with self.db.transaction() as conn:
+                    queue_repairs(checkpoint_repairs)
+                    if not full_scan:
+                        conn.execute("""INSERT INTO settings(key,value) VALUES ('repair_cursor_object_id',?)
+                            ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (row["object_id"],))
+                checkpoint_repairs = []
         return repaired
 
-    def _download_job(self, job, user_id, original_parts, progress=None):
-        drive_id, item_id = job["drive_id"], job["item_id"]
+    def _download_content(self, job, before, progress=None):
         started = time.perf_counter()
-        before = self.graph.metadata(drive_id, item_id)
         if kind(before) != "file":
             raise ValueError("source_not_regular_file")
         expected = content_tag(before)
@@ -353,7 +511,14 @@ class Engine:
             raise ValueError("source_version_tag_missing")
         with self.graph.download(before) as stream:
             object_id, relative, sha256 = self.storage.put(stream, before["size"], progress=progress)
-        after = self.graph.metadata(drive_id, item_id)
+        return {"object_id": object_id, "relative": relative, "sha256": sha256,
+                "size": before["size"], "expected": expected,
+                "elapsed": max(time.perf_counter() - started, 0.000001)}
+
+    def _finalize_download(self, job, user_id, original_parts, before, result, after):
+        drive_id, item_id = job["drive_id"], job["item_id"]
+        object_id, relative, sha256 = result["object_id"], result["relative"], result["sha256"]
+        expected = result["expected"]
         if kind(after) != "file" or content_tag(after) != expected or after.get("size") != before["size"]:
             raise ValueError("source_changed_during_download")
         remote_hash = before.get("file", {}).get("hashes", {}).get("sha256Hash")
@@ -365,22 +530,53 @@ class Engine:
                     "relative_path": relative, "sha256": sha256, "size": before["size"],
                     "metadata": json.loads(encode(after)), "original_parts": original_parts,
                     "created": created, "verification": "mount_readback_only"}
+        site_source = self.db.one("SELECT site_id,profile FROM site_drives WHERE drive_id=?", (drive_id,))
+        if site_source:
+            manifest.update({"source_kind": "sharepoint", "site_id": site_source["site_id"],
+                             "library": json.loads(site_source["profile"]), "user_id": None})
         self.storage.manifest(object_id, manifest)
-        return {"object_id": object_id, "relative": relative, "sha256": sha256,
-                "size": before["size"], "metadata": after, "created": created,
-                "elapsed": max(time.perf_counter() - started, 0.000001)}
+        result.update({"metadata": after, "created": created})
+        return result
+
+    def _download_job(self, job, user_id, original_parts, progress=None):
+        before = self.graph.metadata(job["drive_id"], job["item_id"])
+        result = self._download_content(job, before, progress)
+        after = self.graph.metadata(job["drive_id"], job["item_id"])
+        return self._finalize_download(job, user_id, original_parts, before, result, after)
+
+    @staticmethod
+    def _commit_backup_on(conn, job, result):
+        conn.execute("INSERT INTO objects VALUES (?,?,?,?,?,?,?,?,?)",
+                     (result["object_id"], job["drive_id"], job["item_id"], result["relative"],
+                      result["sha256"], result["size"], encode(result["metadata"]), result["created"],
+                      "mount_readback_only"))
+        conn.execute("UPDATE items SET object_id=? WHERE drive_id=? AND item_id=?",
+                     (result["object_id"], job["drive_id"], job["item_id"]))
+        conn.execute("DELETE FROM expired_items WHERE drive_id=? AND item_id=?",
+                     (job["drive_id"], job["item_id"]))
+        conn.execute("DELETE FROM jobs WHERE job_id=?", (job["job_id"],))
+        conn.execute("INSERT OR IGNORE INTO browse_jobs VALUES (?,?)",
+                     (job["drive_id"], job["item_id"]))
 
     def _commit_backup(self, job, result):
         with self.db.transaction() as conn:
-            conn.execute("INSERT INTO objects VALUES (?,?,?,?,?,?,?,?,?)",
-                         (result["object_id"], job["drive_id"], job["item_id"], result["relative"],
-                          result["sha256"], result["size"], encode(result["metadata"]), result["created"],
-                          "mount_readback_only"))
-            conn.execute("UPDATE items SET object_id=? WHERE drive_id=? AND item_id=?",
-                         (result["object_id"], job["drive_id"], job["item_id"]))
-            conn.execute("DELETE FROM expired_items WHERE drive_id=? AND item_id=?",
-                         (job["drive_id"], job["item_id"]))
-            conn.execute("DELETE FROM jobs WHERE job_id=?", (job["job_id"],))
+            self._commit_backup_on(conn, job, result)
+
+    def _metadata_for_jobs(self, jobs):
+        identities = [(job["drive_id"], job["item_id"]) for job in jobs]
+        batch_method = getattr(self.graph, "metadata_batch", None)
+        if batch_method:
+            try:
+                return batch_method(identities)
+            except (GraphError, OSError, HTTPException, ValueError, KeyError) as exc:
+                return [exc] * len(jobs)
+        results = []
+        for drive_id, item_id in identities:
+            try:
+                results.append(self.graph.metadata(drive_id, item_id))
+            except (GraphError, OSError, HTTPException, ValueError, KeyError) as exc:
+                results.append(exc)
+        return results
 
     def backup_job(self, job):
         drive = self.db.one("SELECT user_id FROM drives WHERE drive_id=?", (job["drive_id"],))
@@ -424,36 +620,73 @@ class Engine:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             for offset in range(0, len(jobs), workers):
                 batch = jobs[offset:offset + workers]
-                submitted = []
+                prepared = []
                 fatal = None
                 for job in batch:
                     try:
                         drive = self.db.one("SELECT user_id FROM drives WHERE drive_id=?", (job["drive_id"],))
                         original_parts = self.original_parts(job["drive_id"], job["item_id"])
-                        with self.db.transaction() as conn:
-                            conn.execute("UPDATE jobs SET state='running' WHERE job_id=?", (job["job_id"],))
-                        future = executor.submit(self._download_job, job, drive["user_id"], original_parts,
-                                                 progress.advance)
-                        submitted.append((job, future))
+                        prepared.append((job, drive["user_id"], original_parts))
                     except (GraphError, StorageError, OSError, HTTPException, ValueError, KeyError) as exc:
                         self._record_job_failure(job, exc)
                         progress.finish_file(False)
                         if isinstance(exc, (StorageError, OSError)):
                             fatal = exc
                             break
-                for job, future in submitted:
+                if prepared:
+                    with self.db.transaction() as conn:
+                        conn.executemany("UPDATE jobs SET state='running' WHERE job_id=?",
+                                         ((entry[0]["job_id"],) for entry in prepared))
+                before_values = self._metadata_for_jobs([entry[0] for entry in prepared])
+                submitted = []
+                for context, before in zip(prepared, before_values):
+                    job, user_id, original_parts = context
+                    if isinstance(before, Exception):
+                        self._record_job_failure(job, before)
+                        progress.finish_file(False)
+                        continue
                     try:
-                        result = future.result()
-                        self._commit_backup(job, result)
-                        rate = result["size"] / result["elapsed"] / (1024 * 1024)
-                        log.info("파일 백업 완료 drive=%s item=%s bytes=%s seconds=%.3f MiB/s=%.2f",
-                                 job["drive_id"], job["item_id"], result["size"], result["elapsed"], rate)
-                        progress.finish_file(True)
+                        future = executor.submit(self._download_content, job, before, progress.advance)
+                        submitted.append((context, before, future))
                     except (GraphError, StorageError, OSError, HTTPException, ValueError, KeyError) as exc:
                         self._record_job_failure(job, exc)
                         progress.finish_file(False)
                         if isinstance(exc, (StorageError, OSError)) and fatal is None:
                             fatal = exc
+                downloaded = []
+                for context, before, future in submitted:
+                    job, user_id, original_parts = context
+                    try:
+                        downloaded.append((context, before, future.result()))
+                    except (GraphError, StorageError, OSError, HTTPException, ValueError, KeyError) as exc:
+                        self._record_job_failure(job, exc)
+                        progress.finish_file(False)
+                        if isinstance(exc, (StorageError, OSError)) and fatal is None:
+                            fatal = exc
+                after_values = self._metadata_for_jobs([entry[0][0] for entry in downloaded])
+                completed = []
+                for downloaded_entry, after in zip(downloaded, after_values):
+                    context, before, result = downloaded_entry
+                    job, user_id, original_parts = context
+                    try:
+                        if isinstance(after, Exception):
+                            raise after
+                        result = self._finalize_download(job, user_id, original_parts, before, result, after)
+                        completed.append((job, result))
+                    except (GraphError, StorageError, OSError, HTTPException, ValueError, KeyError) as exc:
+                        self._record_job_failure(job, exc)
+                        progress.finish_file(False)
+                        if isinstance(exc, (StorageError, OSError)) and fatal is None:
+                            fatal = exc
+                if completed:
+                    with self.db.transaction() as conn:
+                        for job, result in completed:
+                            self._commit_backup_on(conn, job, result)
+                    for job, result in completed:
+                        rate = result["size"] / result["elapsed"] / (1024 * 1024)
+                        log.info("파일 백업 완료 drive=%s item=%s bytes=%s seconds=%.3f MiB/s=%.2f",
+                                 job["drive_id"], job["item_id"], result["size"], result["elapsed"], rate)
+                        progress.finish_file(True)
                 if fatal is not None:
                     # Storage failures stop later batches without discarding completed work.
                     raise fatal
@@ -476,6 +709,9 @@ class Engine:
             log.info("작업 단계 시작 stage=user_discovery")
             errors += self.discover()
             log.info("작업 단계 완료 stage=user_discovery")
+            log.info("작업 단계 시작 stage=site_discovery")
+            errors += self.discover_sites()
+            log.info("작업 단계 완료 stage=site_discovery")
             drives = self.db.all("SELECT * FROM drives WHERE status='active'")
             log.info("드라이브 동기화 시작 drives=%s", len(drives))
             for drive_index, drive in enumerate(drives, 1):

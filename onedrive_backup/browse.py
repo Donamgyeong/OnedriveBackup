@@ -49,6 +49,10 @@ def safe_name(name, identity, limit=100):
 class BrowsePublisher:
     def __init__(self, config, db, storage):
         self.config, self.db, self.storage = config, db, storage
+        self._drive_users = {}
+        self._profiles = {}
+        self._item_payloads = {}
+        self._site_sources = {}
 
     def path(self, relative):
         parts = PurePosixPath(relative).parts
@@ -60,15 +64,32 @@ class BrowsePublisher:
         return result
 
     def destination(self, row):
-        drive = self.db.one("SELECT user_id FROM drives WHERE drive_id=?", (row["drive_id"],))
-        user_id = drive["user_id"] if drive else row["drive_id"]
-        account = self.db.one("SELECT profile FROM accounts WHERE user_id=?", (user_id,))
-        profile = json.loads(account["profile"]) if account else {}
+        drive_id = row["drive_id"]
+        if drive_id not in self._drive_users:
+            drive = self.db.one("SELECT user_id FROM drives WHERE drive_id=?", (drive_id,))
+            self._drive_users[drive_id] = drive["user_id"] if drive else drive_id
+        user_id = self._drive_users[drive_id]
+        if user_id not in self._profiles:
+            account = self.db.one("SELECT profile FROM accounts WHERE user_id=?", (user_id,))
+            self._profiles[user_id] = json.loads(account["profile"]) if account else {}
+        profile = self._profiles[user_id]
         # Explorer folders use the human-readable Microsoft 365 display name.
         # The stable user ID suffix still prevents collisions between namesakes.
         label = profile.get("displayName") or user_id
         base = ["browse", safe_name(label, user_id, 45) + "__" + short_id(user_id),
                 "drive_" + short_id(row["drive_id"]), "deleted" if row["deleted"] else "current"]
+        if drive_id not in self._site_sources:
+            self._site_sources[drive_id] = self.db.one("""SELECT s.site_id,s.profile AS site_profile,d.profile
+                FROM site_drives d JOIN sites s ON s.site_id=d.site_id WHERE d.drive_id=?""", (drive_id,))
+        source = self._site_sources[drive_id]
+        if source:
+            site = json.loads(source["site_profile"])
+            library = json.loads(source["profile"])
+            user_id = source["site_id"]
+            base = ["browse", "SharePoint",
+                    safe_name(site.get("displayName") or site.get("name") or user_id, user_id, 40) + "__" + short_id(user_id),
+                    safe_name(library.get("name") or drive_id, drive_id, 40) + "__" + short_id(drive_id),
+                    "deleted" if row["deleted"] else "current"]
         item = json.loads(row["source_payload"])
         folders, seen = [], {row["item_id"]}
         parent = item.get("parentReference", {}).get("id")
@@ -76,11 +97,15 @@ class BrowsePublisher:
             if parent in seen:
                 raise StorageError("browse_parent_cycle")
             seen.add(parent)
-            found = self.db.one("SELECT payload FROM items WHERE drive_id=? AND item_id=?", (row["drive_id"], parent))
-            if not found:
+            key = (drive_id, parent)
+            if key not in self._item_payloads:
+                found = self.db.one("SELECT payload FROM items WHERE drive_id=? AND item_id=?", key)
+                self._item_payloads[key] = found["payload"] if found else None
+            payload = self._item_payloads[key]
+            if payload is None:
                 folders.append("_unknown_" + short_id(parent))
                 break
-            info = json.loads(found["payload"])
+            info = json.loads(payload)
             if "root" in info:
                 break
             folders.append(safe_name(info.get("name", parent), parent, 50) + "__" + short_id(parent))
@@ -97,7 +122,11 @@ class BrowsePublisher:
         identity = (row["drive_id"], row["item_id"])
         def occupied(candidate):
             owner = reserved.get(candidate.casefold())
-            return owner is not None and owner != identity
+            if owner is not None:
+                return owner != identity
+            entry = self.db.one("""SELECT drive_id,item_id FROM browse_files
+                WHERE relative_path=? COLLATE NOCASE LIMIT 1""", (candidate,))
+            return entry is not None and (entry["drive_id"], entry["item_id"]) != identity
         if occupied(relative):
             path = PurePosixPath(relative)
             suffix = path.suffix
@@ -175,8 +204,16 @@ class BrowsePublisher:
     def sync(self):
         self.storage.check(check_space=False)
         failed, published = 0, 0
+        rows = self.db.all("""SELECT o.*,i.payload AS source_payload,i.deleted FROM browse_jobs j
+            CROSS JOIN items i ON i.drive_id=j.drive_id AND i.item_id=j.item_id
+            CROSS JOIN objects o ON i.object_id=o.object_id WHERE NOT EXISTS
+            (SELECT 1 FROM purge_jobs p WHERE p.resource_id=o.object_id AND p.state='pending')
+            ORDER BY o.drive_id,o.item_id""")
+        if not rows:
+            failed += self.cleanup()
+            return {"published": published, "failed": failed, "path": str(self.storage.root / "browse")}
         reserved = {}
-        for entry in self.db.all("SELECT * FROM browse_files"):
+        for entry in self.db.all("SELECT * FROM browse_files WHERE pending IS NOT NULL"):
             identity = (entry["drive_id"], entry["item_id"])
             if entry["relative_path"]:
                 reserved[entry["relative_path"].casefold()] = identity
@@ -185,10 +222,6 @@ class BrowsePublisher:
         # A stale copy is not available for another item until cleanup succeeds.
         for row in self.db.all("SELECT relative_path FROM browse_cleanup"):
             reserved.setdefault(row["relative_path"].casefold(), ("cleanup", "cleanup"))
-        rows = self.db.all("""SELECT o.*,i.payload AS source_payload,i.deleted FROM items i JOIN objects o
-            ON i.object_id=o.object_id WHERE NOT EXISTS
-            (SELECT 1 FROM purge_jobs p WHERE p.resource_id=o.object_id AND p.state='pending')
-            ORDER BY o.drive_id,o.item_id""")
         total_rows = len(rows)
         processed_rows = 0
         last_progress = time.monotonic()
@@ -227,6 +260,8 @@ class BrowsePublisher:
                         with self.db.transaction() as conn:
                             conn.execute("UPDATE browse_files SET size=?,mtime_ns=? WHERE drive_id=? AND item_id=?",
                                          (target_stat.st_size, target_stat.st_mtime_ns, *identity))
+                    with self.db.transaction() as conn:
+                        conn.execute("DELETE FROM browse_jobs WHERE drive_id=? AND item_id=?", identity)
                     continue
                 if target.exists() and not same_path:
                     raise StorageError("browse_unmanaged_destination_exists")
@@ -238,6 +273,8 @@ class BrowsePublisher:
                         ON CONFLICT(drive_id,item_id) DO UPDATE SET pending=excluded.pending,error=NULL""",
                                  (*identity, json.dumps(pending)))
                 self.resume(self.db.one("SELECT * FROM browse_files WHERE drive_id=? AND item_id=?", identity))
+                with self.db.transaction() as conn:
+                    conn.execute("DELETE FROM browse_jobs WHERE drive_id=? AND item_id=?", identity)
                 published += 1
             except (OSError, StorageError, ValueError) as exc:
                 failed += 1

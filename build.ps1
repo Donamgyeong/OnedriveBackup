@@ -41,7 +41,7 @@ try {
     Copy-Item -LiteralPath "packaging\STATUS.cmd" -Destination $releaseDir
     Copy-Item -LiteralPath "packaging\UPDATE_BROWSE.cmd" -Destination $releaseDir
 
-    $releaseFile = "OneDriveBackup-0.6.1-win64.zip"
+    $releaseFile = "OneDriveBackup-0.10.0-win64.zip"
     $zipPath = Join-Path $projectRoot ("dist\" + $releaseFile)
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force

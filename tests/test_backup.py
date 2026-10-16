@@ -80,6 +80,20 @@ class BackupTest(unittest.TestCase):
         self.scan([ROOT, file_item()])
         self.engine.process_jobs()
 
+    def add_stored_item(self, item_id, object_id):
+        item = file_item("v1", item_id + ".txt")
+        item["id"] = item_id
+        relative = "objects/{}/{}.bin".format(object_id[:2], object_id)
+        path = self.storage.path(relative)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"hello")
+        with self.db.transaction() as conn:
+            conn.execute("INSERT INTO items(drive_id,item_id,payload,deleted,object_id) VALUES (?,?,?,0,?)",
+                         ("drive1", item_id, encode(item), object_id))
+            conn.execute("INSERT INTO objects VALUES (?,?,?,?,?,?,?,?,?)",
+                         (object_id, "drive1", item_id, relative, "unused", 5,
+                          encode(item), 100, "mount_readback_only"))
+
     def test_initial_then_unchanged_and_rename_do_not_download(self):
         self.first_backup()
         self.scan([file_item(name="renamed.txt")], "delta2")
@@ -102,11 +116,16 @@ class BackupTest(unittest.TestCase):
                 self.lock = threading.Lock()
                 self.active = 0
                 self.max_active = 0
+                self.metadata_batches = []
 
             def metadata(self, drive_id, item_id):
                 item = file_item("v1", item_id + ".txt")
                 item["id"] = item_id
                 return item
+
+            def metadata_batch(self, identities):
+                self.metadata_batches.append(list(identities))
+                return [self.metadata(*identity) for identity in identities]
 
             def download(self, item):
                 with self.lock:
@@ -131,6 +150,7 @@ class BackupTest(unittest.TestCase):
         with self.assertLogs("onedrive_backup.engine", level="INFO") as captured:
             Engine(cfg, self.db, graph, Storage(cfg)).process_jobs()
         self.assertEqual(graph.max_active, 2)
+        self.assertEqual([len(batch) for batch in graph.metadata_batches], [2, 2])
         self.assertEqual(self.db.one("SELECT COUNT(*) FROM objects")[0], 2)
         self.assertEqual(self.db.one("SELECT COUNT(*) FROM jobs")[0], 0)
         output = "\n".join(captured.output)
@@ -255,10 +275,12 @@ class BackupTest(unittest.TestCase):
         values = asdict(self.cfg)
         del values["download_concurrency"]
         del values["download_chunk_bytes"]
+        del values["repair_check_batch_size"]
         path.write_text(json.dumps(values), encoding="utf-8")
         loaded = Config.load(path)
         self.assertEqual(loaded.download_concurrency, 4)
         self.assertEqual(loaded.download_chunk_bytes, 8 * 1024 * 1024)
+        self.assertEqual(loaded.repair_check_batch_size, 10000)
 
     def test_existing_database_adds_browse_signature_columns(self):
         path = Path(self.temp.name) / "legacy.sqlite"
@@ -303,6 +325,28 @@ class BackupTest(unittest.TestCase):
         finally:
             error.close()
 
+    def test_graph_metadata_batch_preserves_order_and_retries_throttled_items(self):
+        client = GraphClient(self.cfg)
+        responses = [
+            {"responses": [
+                {"id": "0", "status": 429, "headers": {"Retry-After": "0"},
+                 "body": {"error": {"code": "throttledRequest"}}},
+                {"id": "1", "status": 200, "body": {"id": "file2"}},
+            ]},
+            {"responses": [{"id": "0", "status": 200, "body": {"id": "file1"}}]},
+        ]
+        with patch.object(client, "post_json", side_effect=responses) as posted, \
+                patch.object(client, "delay", return_value=0):
+            result = client.metadata_batch([("drive1", "file1"), ("drive1", "file2")])
+        self.assertEqual([item["id"] for item in result], ["file1", "file2"])
+        self.assertEqual(posted.call_count, 2)
+        self.assertEqual(len(posted.call_args_list[0].args[1]["requests"]), 2)
+        self.assertEqual(len(posted.call_args_list[1].args[1]["requests"]), 1)
+
+    def test_graph_metadata_batch_rejects_more_than_twenty_items(self):
+        with self.assertRaisesRegex(ValueError, "graph_batch_limit_exceeded"):
+            GraphClient(self.cfg).metadata_batch([("drive", str(index)) for index in range(21)])
+
     def test_discovery_treats_missing_onedrive_as_expected(self):
         class MissingDriveGraph:
             def pages(self, url):
@@ -330,6 +374,65 @@ class BackupTest(unittest.TestCase):
             self.assertEqual(self.engine.discover(), 1)
         self.assertIn("status=403 code=accessDenied", "\n".join(captured.output))
 
+    def test_sharepoint_discovery_subsites_libraries_and_readable_backup(self):
+        responses = {
+            "/sites/getAllSites": [{"value": [{"id": "site1", "displayName": "Research"}]}],
+            "/sites/site1/drives": [{"value": [{"id": "docs", "name": "Documents", "driveType": "documentLibrary"}]},
+                                    {"value": [{"id": "docs", "name": "Documents", "driveType": "documentLibrary"}]}],
+            "/sites/site1/sites": [{"value": [{"id": "subsite", "displayName": "Subsite"}]}],
+            "/sites/subsite/drives": [{"value": [{"id": "subdocs", "driveType": "documentLibrary"}]}],
+            "/sites/subsite/sites": [{"value": []}],
+        }
+        with patch.object(self.graph, "pages", side_effect=lambda url: iter(responses[url]), create=True):
+            self.assertEqual(self.engine.discover_sites(), 0)
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM site_drives")[0], 2)
+        self.graph.responses.append({"value": [ROOT, file_item()], "@odata.deltaLink": "docs-delta"})
+        self.engine.scan("docs")
+        self.engine.process_jobs()
+        self.assertEqual(self.browse().sync()["failed"], 0)
+        entry = self.db.one("SELECT * FROM browse_files WHERE drive_id='docs'")
+        self.assertIn("browse/SharePoint/Research__", entry["relative_path"])
+        self.assertEqual(self.storage.path(entry["relative_path"]).read_bytes(), b"hello")
+        manifest = json.loads(self.storage.path("manifests/" + entry["object_id"] + ".json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["site_id"], "site1")
+        self.assertIsNone(manifest["user_id"])
+        old_path = self.storage.path(entry["relative_path"])
+        responses["/sites/site1/drives"] = [{"value": [
+            {"id": "docs", "name": "Renamed", "driveType": "documentLibrary"}]}]
+        with patch.object(self.graph, "pages", side_effect=lambda url: iter(responses[url]), create=True):
+            self.assertEqual(self.engine.discover_sites(), 0)
+        self.assertEqual(self.db.one("SELECT delta_link FROM drives WHERE drive_id='docs'")[0], "docs-delta")
+        self.assertEqual(self.browse().sync()["failed"], 0)
+        self.assertIn("Renamed__", self.db.one("SELECT relative_path FROM browse_files WHERE drive_id='docs'")[0])
+        self.assertFalse(old_path.exists())
+        self.assertEqual(self.graph.download_count, 1)
+
+    def test_sharepoint_enumeration_failure_preserves_existing_drive(self):
+        with self.db.transaction() as conn:
+            conn.execute("INSERT INTO sites VALUES ('site1','{}','active',1)")
+            conn.execute("INSERT INTO site_drives VALUES ('drive1','site1','{}')")
+        with patch.object(self.graph, "pages", side_effect=GraphError(403, "accessDenied"), create=True):
+            self.assertEqual(self.engine.discover_sites(), 1)
+        self.assertEqual(self.db.one("SELECT status FROM drives WHERE drive_id='drive1'")[0], "active")
+
+    def test_sharepoint_one_site_denied_still_discovers_other_sites(self):
+        def pages(url):
+            if url == "/sites/getAllSites":
+                yield {"value": [{"id": "allowed"}]}
+                yield {"value": [{"id": "denied"}]}
+            elif url == "/sites/denied/drives":
+                raise GraphError(403, "accessDenied")
+            elif url == "/sites/allowed/drives":
+                yield {"value": [{"id": "library", "driveType": "documentLibrary"}]}
+            elif url == "/sites/denied/sites":
+                yield {"value": [{"id": "allowed"}]}
+            else:
+                yield {"value": []}
+        with patch.object(self.graph, "pages", side_effect=pages, create=True):
+            self.assertEqual(self.engine.discover_sites(), 1)
+        self.assertEqual(self.db.one("SELECT status FROM sites WHERE site_id='denied'")[0], "error")
+        self.assertEqual(self.db.one("SELECT status FROM drives WHERE drive_id='library'")[0], "active")
+
     def test_lock_prevents_duplicate_process(self):
         with ProcessLock(self.cfg.sqlite_path + ".lock"):
             with self.assertRaises(StorageError):
@@ -343,6 +446,34 @@ class BackupTest(unittest.TestCase):
         self.scan([], "delta2")
         self.assertEqual(self.db.one("SELECT delta_link FROM drives")[0], "delta2")
         self.assertEqual(self.db.one("SELECT state FROM jobs")[0], "pending")
+
+    def test_initial_repair_check_skips_files_already_queued_for_download(self):
+        self.scan([ROOT, file_item()])
+        with patch.object(self.db, "queue", wraps=self.db.queue) as queued:
+            self.assertEqual(self.engine.repair_missing(), 0)
+        queued.assert_not_called()
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM jobs")[0], 1)
+
+    def test_automatic_repair_check_uses_persistent_batches(self):
+        for number in range(1, 4):
+            self.add_stored_item("stored" + str(number), str(number) * 32)
+        engine = Engine(replace(self.cfg, repair_check_batch_size=2), self.db, self.graph, self.storage)
+        with patch.object(self.storage, "exists", wraps=self.storage.exists) as checked:
+            self.assertEqual(engine.repair_missing(), 0)
+        self.assertEqual(checked.call_count, 2)
+        self.assertEqual(self.db.one("SELECT value FROM settings WHERE key='repair_cursor_object_id'")[0], "2" * 32)
+        with patch.object(self.storage, "exists", wraps=self.storage.exists) as checked:
+            self.assertEqual(engine.repair_missing(), 0)
+        self.assertEqual(checked.call_count, 2)
+        self.assertEqual(self.db.one("SELECT value FROM settings WHERE key='repair_cursor_object_id'")[0], "1" * 32)
+
+    def test_manual_hash_verify_ignores_automatic_batch_limit(self):
+        for number in range(1, 4):
+            self.add_stored_item("verify" + str(number), str(number) * 32)
+        engine = Engine(replace(self.cfg, repair_check_batch_size=1), self.db, self.graph, self.storage)
+        with patch.object(self.storage, "exists", wraps=self.storage.exists) as checked:
+            engine.repair_missing(verify_hash=True, full_scan=True)
+        self.assertEqual(checked.call_count, 3)
 
     def test_repeat_delta_does_not_reset_failed_attempts(self):
         self.scan([ROOT, file_item()])
@@ -374,7 +505,7 @@ class BackupTest(unittest.TestCase):
             execute(args, self.cfg, self.db, self.storage)
 
     def test_full_run_creates_verified_catalog(self):
-        pages = lambda url: iter([{"value": [{"id": "user1"}]}] if url.startswith("/users?") else
+        pages = lambda url: iter([{"value": []}] if url.startswith("/sites/") else [{"value": [{"id": "user1"}]}] if url.startswith("/users?") else
                                  [{"value": [{"id": "drive1", "driveType": "business"}]}])
         self.graph.responses = [{"value": [ROOT, file_item()], "@odata.deltaLink": "delta1"}]
         with patch.object(self.graph, "pages", side_effect=pages, create=True), \
@@ -433,7 +564,8 @@ class BackupTest(unittest.TestCase):
         self.first_backup()
         self.age_objects()
         obj = self.db.one("SELECT * FROM objects")
-        self.assertEqual(self.retention().prune(now=86500)["completed"], 0)
+        with patch("onedrive_backup.retention.digest", side_effect=AssertionError("single version must not be hashed")):
+            self.assertEqual(self.retention().prune(now=86500)["completed"], 0)
         self.assertTrue(self.storage.path(obj["relative_path"]).exists())
         self.assertTrue(self.storage.path(f"manifests/{obj['object_id']}.json").exists())
         self.scan([file_item()], "delta2")
@@ -538,7 +670,7 @@ class BackupTest(unittest.TestCase):
         self.second_backup()
         self.age_objects()
         self.engine.config = replace(self.cfg, retention_policy="expire_after_days", retention_days=1)
-        pages = lambda url: iter([{"value": [{"id": "user1"}]}] if url.startswith("/users?") else
+        pages = lambda url: iter([{"value": []}] if url.startswith("/sites/") else [{"value": [{"id": "user1"}]}] if url.startswith("/users?") else
                                  [{"value": [{"id": "drive1", "driveType": "business"}]}])
         self.graph.responses = [{"value": [], "@odata.deltaLink": "delta2"}]
         with patch.object(self.graph, "pages", side_effect=pages, create=True):
@@ -640,7 +772,10 @@ class BackupTest(unittest.TestCase):
         self.assertEqual(self.view_path().read_bytes(), b"hello")
         self.assertEqual(self.graph.download_count, before)
         with patch("onedrive_backup.browse.digest", side_effect=AssertionError("unexpected rehash")):
-            self.assertEqual(self.browse().sync()["published"], 0)
+            publisher = self.browse()
+            with patch.object(publisher, "destination", side_effect=AssertionError("unexpected full browse walk")):
+                self.assertEqual(publisher.sync()["published"], 0)
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM browse_jobs")[0], 0)
 
     def test_browse_account_folder_uses_display_name_instead_of_email(self):
         with self.db.transaction() as conn:

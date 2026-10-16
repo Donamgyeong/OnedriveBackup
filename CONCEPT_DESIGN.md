@@ -2,6 +2,8 @@
 
 상태: 개념 설계 초안. 구현 코드와 배포 설정은 포함하지 않는다.
 
+SharePoint 지원 추가 사항: 현재 구현은 `/sites/getAllSites`와 하위 사이트 검색을 통해 사이트를 열거하고, 각 사이트의 모든 문서 라이브러리에 기존 증분 파일 백업을 적용한다. `Sites.Read.All` application 권한과 관리자 동의가 필요하다. 사이트 설정·일반 목록·권한 백업은 범위에 포함하지 않는다. 탐색용 파일은 `browse/SharePoint` 아래 사이트와 라이브러리별로 표시한다.
+
 탐색기 열람 추가 사항: 기존 불변 버전 저장소에서 최신 파일을 `browse` 아래 계정·폴더별로 복사하여 원래 파일명과 확장자로 제공한다. 백업 실행 후 자동 갱신하며, 기존 백업에는 `browse` 명령으로 적용할 수 있다. 삭제된 원본의 마지막 백업은 별도 `deleted` 영역에 유지한다. 세부 동작은 README를 따른다.
 
 구현 후 추가 사항: `expire_after_days` 정책과 `retention_days` 설정으로 버전 저장 완료 시각 기준 폐기를 지원한다. 파일별 최신 백업 1개는 보존 기간이나 원본 삭제 여부와 관계없이 유지하며, 만료된 이전 버전만 폐기한다. 미정 보존 일수는 빈 값으로 유지하며, 현재 구현 동작과 제한은 README의 '기간 경과 폐기'를 참고한다. 아래 내용은 최초 개념 설계 기록이다.
@@ -110,6 +112,8 @@ flowchart LR
 
 다운로드 전후 원본 태그를 비교하여 도중 변경이 관측되면 재시도한다. 지속적으로 수정되는 파일은 미완료 상태로 남긴다. 특정 버전에 고정한 읽기 지원과 과거 버전 보존은 별도 확인 항목이다. 전체 드라이브의 동일 시점 스냅샷은 이 방식으로 보장하지 않는다.
 
+작은 파일이 많은 경우 같은 동시 다운로드 묶음의 사전·사후 메타데이터를 Microsoft Graph JSON batch로 조회하여 HTTP 왕복 횟수를 줄인다. 파일 내용 스트림은 API 제약에 따라 항목별로 내려받고, batch 내부 제한 응답은 해당 항목만 `Retry-After`에 따라 재시도한다. 성공 결과의 SQLite 반영은 묶음당 한 트랜잭션으로 처리한다.
+
 다운로드 API가 반환하는 임시 다운로드 URL은 장기 저장하거나 로그에 출력하지 않는다. 만료 시 새로 발급받는다. 참고: [파일 다운로드 API](https://learn.microsoft.com/en-us/graph/api/driveitem-get-content?view=graph-rest-1.0).
 
 ## 5. 중앙화 저장소 기록
@@ -155,6 +159,7 @@ flowchart LR
 | items | drive_id, item_id, parent_id, name, kind, source_etag, source_ctag, size, deleted_at | 마지막 관측 원본 상태 |
 | backup_objects | object_id, drive_id, item_id, backed_up_tag, target_path, size, sha256, status, verified_at | 실제 저장된 내용 |
 | jobs | job_id, batch_id, drive_id, item_id, action, expected_tag, state, attempts, retry_at, error | 영속 작업 큐 |
+| browse_jobs | drive_id, item_id | 탐색기 보기에서 새로 게시하거나 경로를 바꿀 항목의 영속 큐 |
 | runs | run_id, started_at, finished_at, status, summary | 실행 이력 |
 
 `items`의 기본키는 `(drive_id, item_id)`로 한다. 작업에는 수집 회차·항목·작업 종류 기반 중복 방지 키를 두고, 버전 태그가 없는 경우도 처리한다. 시각은 UTC로 저장한다.

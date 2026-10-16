@@ -12,6 +12,10 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE TABLE IF NOT EXISTS drives (
  drive_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, delta_link TEXT,
  last_scan REAL, last_backup REAL, status TEXT NOT NULL DEFAULT 'new');
+CREATE TABLE IF NOT EXISTS sites (
+ site_id TEXT PRIMARY KEY, profile TEXT NOT NULL, status TEXT NOT NULL, seen REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS site_drives (
+ drive_id TEXT PRIMARY KEY, site_id TEXT NOT NULL, profile TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS scans (
  drive_id TEXT PRIMARY KEY, next_link TEXT NOT NULL, full_scan INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS scan_items (
@@ -30,10 +34,12 @@ CREATE TABLE IF NOT EXISTS objects (
  object_id TEXT PRIMARY KEY, drive_id TEXT NOT NULL, item_id TEXT NOT NULL,
  relative_path TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
  payload TEXT NOT NULL, created REAL NOT NULL, verification TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS objects_file_created ON objects(drive_id,item_id,created);
 CREATE TABLE IF NOT EXISTS runs (
  run_id INTEGER PRIMARY KEY AUTOINCREMENT, started REAL NOT NULL, finished REAL,
  status TEXT NOT NULL, summary TEXT);
 CREATE INDEX IF NOT EXISTS jobs_due ON jobs(state,retry_at);
+CREATE INDEX IF NOT EXISTS items_object ON items(object_id);
 CREATE TABLE IF NOT EXISTS expired_items (
  drive_id TEXT NOT NULL, item_id TEXT NOT NULL, content_tag TEXT,
  PRIMARY KEY(drive_id,item_id));
@@ -45,8 +51,12 @@ CREATE TABLE IF NOT EXISTS browse_files (
  drive_id TEXT NOT NULL, item_id TEXT NOT NULL, relative_path TEXT,
  object_id TEXT, sha256 TEXT, pending TEXT, error TEXT, size INTEGER, mtime_ns INTEGER,
  PRIMARY KEY(drive_id,item_id));
+CREATE INDEX IF NOT EXISTS browse_path_nocase ON browse_files(relative_path COLLATE NOCASE);
 CREATE TABLE IF NOT EXISTS browse_cleanup (
  relative_path TEXT PRIMARY KEY, object_id TEXT NOT NULL, sha256 TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS browse_jobs (
+ drive_id TEXT NOT NULL, item_id TEXT NOT NULL,
+ PRIMARY KEY(drive_id,item_id));
 """
 
 
@@ -66,6 +76,14 @@ class Database:
             self.conn.execute("ALTER TABLE browse_files ADD COLUMN size INTEGER")
         if "mtime_ns" not in browse_columns:
             self.conn.execute("ALTER TABLE browse_files ADD COLUMN mtime_ns INTEGER")
+        # Upgrade existing catalogs without forcing a complete browse-tree walk.
+        # Only entries that are absent, incomplete, or point at an older object
+        # need publishing; future metadata changes are queued by the scan commit.
+        self.conn.execute("""INSERT OR IGNORE INTO browse_jobs(drive_id,item_id)
+            SELECT i.drive_id,i.item_id FROM items i JOIN objects o ON i.object_id=o.object_id
+            LEFT JOIN browse_files b ON b.drive_id=i.drive_id AND b.item_id=i.item_id
+            WHERE b.item_id IS NULL OR b.object_id IS NULL OR b.object_id<>i.object_id OR b.pending IS NOT NULL
+                OR b.error IS NOT NULL""")
         for key, value in (("tenant_id", tenant_id), ("backup_root", str(Path(backup_root).resolve())), ("schema_version", "1")):
             row = self.one("SELECT value FROM settings WHERE key=?", (key,))
             if row and row["value"] != value:

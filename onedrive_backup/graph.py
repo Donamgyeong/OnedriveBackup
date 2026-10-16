@@ -60,6 +60,16 @@ def safe_http_error_code(exc):
     return "request_failed"
 
 
+def safe_error_payload_code(payload):
+    try:
+        code = payload.get("error", {}).get("code")
+        if isinstance(code, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,99}", code):
+            return code
+    except (AttributeError, TypeError):
+        pass
+    return "request_failed"
+
+
 class GraphClient:
     def __init__(self, config):
         self.config = config
@@ -135,6 +145,26 @@ class GraphClient:
                     raise
                 self.token = None
 
+    def post_json(self, url, payload):
+        if url.startswith("/"):
+            url = self.config.graph_url + url
+        base, target = urlsplit(self.config.graph_url), urlsplit(url)
+        if (target.scheme, target.netloc) != (base.scheme, base.netloc) or not target.path.startswith(base.path + "/"):
+            raise GraphError(0, "untrusted_graph_link")
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        for attempt in range(2):
+            request = Request(url, data=encoded, method="POST", headers={
+                "Authorization": "Bearer " + self.access_token(),
+                "Content-Type": "application/json",
+            })
+            try:
+                with self._open(request) as response:
+                    return json.load(response)
+            except GraphError as exc:
+                if exc.status != 401 or attempt:
+                    raise
+                self.token = None
+
     def pages(self, url):
         while url:
             page = self.get(url)
@@ -143,6 +173,66 @@ class GraphClient:
 
     def metadata(self, drive_id, item_id):
         return self.get(f"/drives/{segment(drive_id)}/items/{segment(item_id)}")
+
+    def metadata_batch(self, identities):
+        """Fetch up to 20 driveItem resources while preserving per-item failures."""
+        if len(identities) > 20:
+            raise ValueError("graph_batch_limit_exceeded")
+        if identities:
+            log.info("Graph 메타데이터 배치 조회 시작 items=%s", len(identities))
+        results = [None] * len(identities)
+        pending = {str(index): (index, drive_id, item_id)
+                   for index, (drive_id, item_id) in enumerate(identities)}
+        for attempt in range(self.config.max_http_attempts):
+            requests = [{"id": request_id, "method": "GET",
+                         "url": "/drives/{}/items/{}".format(segment(drive_id), segment(item_id))}
+                        for request_id, (_, drive_id, item_id) in pending.items()]
+            try:
+                payload = self.post_json("/$batch", {"requests": requests})
+            except GraphError as exc:
+                return [exc if result is None else result for result in results]
+            responses = {str(response.get("id")): response for response in payload.get("responses", [])
+                         if isinstance(response, dict)}
+            retry = {}
+            retry_after = None
+            for request_id, identity in pending.items():
+                index, drive_id, item_id = identity
+                response = responses.get(request_id)
+                if not response:
+                    results[index] = GraphError(0, "batch_response_missing")
+                    continue
+                status = response.get("status")
+                body = response.get("body", {})
+                if isinstance(status, int) and 200 <= status < 300 and isinstance(body, dict):
+                    results[index] = body
+                    continue
+                if status in (429, 500, 502, 503, 504) and attempt + 1 < self.config.max_http_attempts:
+                    retry[request_id] = (index, drive_id, item_id)
+                    headers = response.get("headers", {})
+                    if isinstance(headers, dict):
+                        value = next((v for k, v in headers.items() if str(k).casefold() == "retry-after"), None)
+                        if value is not None:
+                            try:
+                                retry_after = max(float(value), retry_after or 0)
+                            except (TypeError, ValueError):
+                                pass
+                    continue
+                results[index] = GraphError(status if isinstance(status, int) else 0,
+                                            safe_error_payload_code(body))
+            if not retry:
+                break
+            wait_seconds = self.delay(attempt, str(retry_after) if retry_after is not None else None)
+            log.warning("Graph 배치 요청 재시도 items=%s attempt=%s/%s wait_seconds=%.1f",
+                        len(retry), attempt + 1, self.config.max_http_attempts, wait_seconds)
+            time.sleep(wait_seconds)
+            pending = retry
+        for request_id, (index, _, _) in pending.items():
+            if results[index] is None:
+                results[index] = GraphError(0, "batch_retry_exhausted")
+        if identities:
+            failed = sum(isinstance(result, Exception) for result in results)
+            log.info("Graph 메타데이터 배치 조회 완료 items=%s failed=%s", len(identities), failed)
+        return results
 
     def download(self, metadata):
         url = metadata.get("@microsoft.graph.downloadUrl")
