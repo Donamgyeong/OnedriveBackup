@@ -1,7 +1,7 @@
 {
   "tenant_id": null,
   "client_id": null,
-  "client_secret_env": null,
+  "client_secret": null,
   "authority_url": null,
   "graph_url": null,
   "sqlite_path": null,
@@ -14,6 +14,8 @@
   "retry_base_seconds": null,
   "http_timeout_seconds": null,
   "max_http_attempts": null,
+  "download_concurrency": 4,
+  "download_chunk_bytes": 8388608,
   "retention_policy": null,
   "retention_days": null,
   "special_item_policy": null,

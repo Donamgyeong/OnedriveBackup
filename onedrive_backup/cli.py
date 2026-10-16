@@ -7,11 +7,12 @@ import sys
 import time
 from pathlib import Path
 
+from .compat import is_path_within
 from .config import Config, ConfigError
 from .db import Database
 from .engine import Engine
 from .graph import GraphClient
-from .storage import ProcessLock, Storage, StorageError, digest
+from .storage import ProcessLock, Storage, StorageError, digest, storage_error_detail
 from .retention import Retention
 from .browse import BrowsePublisher
 
@@ -95,7 +96,7 @@ def execute(args, cfg, db, storage):
         if digest(source) != row["sha256"]:
             raise StorageError("backup_checksum_mismatch")
         destination = Path(args.output).resolve()
-        if destination.is_relative_to(storage.root):
+        if is_path_within(destination, storage.root):
             raise ValueError("복원 출력은 백업 루트 밖으로 지정하세요")
         if destination == Path(cfg.sqlite_path).resolve():
             raise ValueError("DB 경로로 복원할 수 없습니다")
@@ -130,5 +131,6 @@ def main(argv=None):
         return 2
     except (OSError, ValueError, StorageError, sqlite3.Error) as exc:
         # Suppress URLs and arbitrary exception payloads in operational output.
-        print(f"실행할 수 없습니다: {type(exc).__name__}", file=sys.stderr)
+        detail = storage_error_detail(exc) if isinstance(exc, StorageError) else type(exc).__name__
+        print(f"실행할 수 없습니다: {detail}", file=sys.stderr)
         return 1

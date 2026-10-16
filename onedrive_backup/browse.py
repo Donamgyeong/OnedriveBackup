@@ -5,14 +5,27 @@ import logging
 import os
 import re
 import shutil
+import time
 import unicodedata
 import uuid
 from pathlib import PurePosixPath
 
+from .compat import is_path_within
 from .storage import StorageError, digest
 
 
 log = logging.getLogger(__name__)
+
+
+class HashingReader:
+    def __init__(self, stream, checksum):
+        self.stream = stream
+        self.checksum = checksum
+
+    def read(self, size=-1):
+        block = self.stream.read(size)
+        self.checksum.update(block)
+        return block
 
 
 def short_id(value):
@@ -42,7 +55,7 @@ class BrowsePublisher:
         if not parts or parts[0] != "browse" or any(p in (".", "..") for p in parts):
             raise StorageError("invalid_browse_path")
         result = self.storage.path(relative)
-        if not result.is_relative_to(self.storage.root / "browse"):
+        if not is_path_within(result, (self.storage.root / "browse").resolve()):
             raise StorageError("browse_path_outside_view")
         return result
 
@@ -51,7 +64,9 @@ class BrowsePublisher:
         user_id = drive["user_id"] if drive else row["drive_id"]
         account = self.db.one("SELECT profile FROM accounts WHERE user_id=?", (user_id,))
         profile = json.loads(account["profile"]) if account else {}
-        label = profile.get("userPrincipalName") or profile.get("displayName") or user_id
+        # Explorer folders use the human-readable Microsoft 365 display name.
+        # The stable user ID suffix still prevents collisions between namesakes.
+        label = profile.get("displayName") or user_id
         base = ["browse", safe_name(label, user_id, 45) + "__" + short_id(user_id),
                 "drive_" + short_id(row["drive_id"]), "deleted" if row["deleted"] else "current"]
         item = json.loads(row["source_payload"])
@@ -109,17 +124,18 @@ class BrowsePublisher:
         if actual != pending["sha256"]:
             self.storage.check(source["size"])
             original = self.storage.path(source["relative_path"])
-            if not self.storage.exists(source["relative_path"], source["size"]) or digest(original) != source["sha256"]:
+            if not self.storage.exists(source["relative_path"], source["size"]):
                 raise StorageError("browse_source_checksum_mismatch")
             target.parent.mkdir(parents=True, exist_ok=True)
             # This exact temp path was persisted before writing; retry can safely replace it.
             if temporary.exists():
                 self.storage.remove(pending["temporary"])
+            copied_hash = hashlib.sha256()
             with original.open("rb") as src, temporary.open("xb") as dst:
-                shutil.copyfileobj(src, dst, 1024 * 1024)
+                shutil.copyfileobj(HashingReader(src, copied_hash), dst, self.config.download_chunk_bytes)
                 dst.flush()
                 os.fsync(dst.fileno())
-            if digest(temporary) != pending["sha256"]:
+            if copied_hash.hexdigest() != pending["sha256"]:
                 raise StorageError("browse_copy_checksum_mismatch")
             self.storage.check(check_space=False)
             # Catch edits made while copying before replacing an owned destination.
@@ -128,14 +144,17 @@ class BrowsePublisher:
             os.replace(temporary, target)
         if digest(target) != pending["sha256"]:
             raise StorageError("browse_readback_checksum_mismatch")
+        target_stat = target.stat()
         if temporary.exists():
             self.storage.remove(pending["temporary"])
         with self.db.transaction() as conn:
             if entry["relative_path"] and entry["relative_path"] != pending["path"]:
                 conn.execute("INSERT OR REPLACE INTO browse_cleanup VALUES (?,?,?)",
                              (entry["relative_path"], entry["object_id"], entry["sha256"]))
-            conn.execute("""UPDATE browse_files SET relative_path=?,object_id=?,sha256=?,pending=NULL,error=NULL
+            conn.execute("""UPDATE browse_files SET relative_path=?,object_id=?,sha256=?,pending=NULL,error=NULL,
+                size=?,mtime_ns=?
                 WHERE drive_id=? AND item_id=?""", (pending["path"], pending["object_id"], pending["sha256"],
+                                                     target_stat.st_size, target_stat.st_mtime_ns,
                                                      entry["drive_id"], entry["item_id"]))
 
     def cleanup(self):
@@ -170,6 +189,11 @@ class BrowsePublisher:
             ON i.object_id=o.object_id WHERE NOT EXISTS
             (SELECT 1 FROM purge_jobs p WHERE p.resource_id=o.object_id AND p.state='pending')
             ORDER BY o.drive_id,o.item_id""")
+        total_rows = len(rows)
+        processed_rows = 0
+        last_progress = time.monotonic()
+        if total_rows:
+            log.info("탐색기 보기 동기화 시작 files=%s", total_rows)
         for row in rows:
             try:
                 parts = PurePosixPath(self.destination(row)).parts
@@ -187,10 +211,22 @@ class BrowsePublisher:
                 relative = self.allocate(self.destination(row), row, reserved)
                 target = self.path(relative)
                 same_path = entry and entry["relative_path"] == relative
-                if same_path and entry["object_id"] == row["object_id"] and target.is_file() and digest(target) == row["sha256"]:
+                unchanged = same_path and entry["object_id"] == row["object_id"] and target.is_file()
+                if unchanged:
+                    target_stat = target.stat()
+                    signature_matches = (entry["size"] == target_stat.st_size
+                                         and entry["mtime_ns"] == target_stat.st_mtime_ns)
+                    verified = signature_matches or digest(target) == row["sha256"]
+                else:
+                    verified = False
+                if verified:
                     if entry["error"]:
                         with self.db.transaction() as conn:
                             conn.execute("UPDATE browse_files SET error=NULL WHERE drive_id=? AND item_id=?", identity)
+                    if not signature_matches:
+                        with self.db.transaction() as conn:
+                            conn.execute("UPDATE browse_files SET size=?,mtime_ns=? WHERE drive_id=? AND item_id=?",
+                                         (target_stat.st_size, target_stat.st_mtime_ns, *identity))
                     continue
                 if target.exists() and not same_path:
                     raise StorageError("browse_unmanaged_destination_exists")
@@ -210,5 +246,13 @@ class BrowsePublisher:
                     conn.execute("UPDATE browse_files SET error=? WHERE drive_id=? AND item_id=?",
                                  (str(exc) if isinstance(exc, StorageError) else type(exc).__name__, *identity))
                 log.error("탐색기 보기 갱신 실패 drive=%s item=%s type=%s", *identity, type(exc).__name__)
+            finally:
+                processed_rows += 1
+                now = time.monotonic()
+                if processed_rows == total_rows or now - last_progress >= 1.0:
+                    log.info("탐색기 보기 동기화 진행 files=%s/%s published=%s failed=%s percent=%.1f%%",
+                             processed_rows, total_rows, published, failed,
+                             processed_rows * 100.0 / total_rows)
+                    last_progress = now
         failed += self.cleanup()
         return {"published": published, "failed": failed, "path": str(self.storage.root / "browse")}

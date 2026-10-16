@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS purge_jobs (
  requested REAL NOT NULL, completed REAL, error TEXT);
 CREATE TABLE IF NOT EXISTS browse_files (
  drive_id TEXT NOT NULL, item_id TEXT NOT NULL, relative_path TEXT,
- object_id TEXT, sha256 TEXT, pending TEXT, error TEXT,
+ object_id TEXT, sha256 TEXT, pending TEXT, error TEXT, size INTEGER, mtime_ns INTEGER,
  PRIMARY KEY(drive_id,item_id));
 CREATE TABLE IF NOT EXISTS browse_cleanup (
  relative_path TEXT PRIMARY KEY, object_id TEXT NOT NULL, sha256 TEXT NOT NULL);
@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS browse_cleanup (
 
 class Database:
     def __init__(self, path, tenant_id, backup_root):
+        if sqlite3.sqlite_version_info < (3, 24, 0):
+            raise sqlite3.NotSupportedError("SQLite 3.24.0 or newer is required")
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
@@ -59,6 +61,11 @@ class Database:
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
+        browse_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(browse_files)")}
+        if "size" not in browse_columns:
+            self.conn.execute("ALTER TABLE browse_files ADD COLUMN size INTEGER")
+        if "mtime_ns" not in browse_columns:
+            self.conn.execute("ALTER TABLE browse_files ADD COLUMN mtime_ns INTEGER")
         for key, value in (("tenant_id", tenant_id), ("backup_root", str(Path(backup_root).resolve())), ("schema_version", "1")):
             row = self.one("SELECT value FROM settings WHERE key=?", (key,))
             if row and row["value"] != value:

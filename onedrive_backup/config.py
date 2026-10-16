@@ -1,8 +1,10 @@
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlsplit
+
+from .compat import is_path_within
 
 
 class ConfigError(ValueError):
@@ -13,7 +15,7 @@ class ConfigError(ValueError):
 class Config:
     tenant_id: str
     client_id: str
-    client_secret_env: str
+    client_secret: str
     authority_url: str
     graph_url: str
     sqlite_path: str
@@ -29,12 +31,18 @@ class Config:
     retention_policy: str
     special_item_policy: str
     guest_account_policy: str
-    retention_days: int | None = None
+    retention_days: Optional[int] = None
+    download_concurrency: int = 4
+    download_chunk_bytes: int = 8 * 1024 * 1024
 
     @classmethod
     def load(cls, path):
         raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-        missing = [key for key in cls.__annotations__ if key != "retention_days" and raw.get(key) in (None, "")]
+        raw.setdefault("retention_days", None)
+        raw.setdefault("download_concurrency", 4)
+        raw.setdefault("download_chunk_bytes", 8 * 1024 * 1024)
+        optional = {"retention_days", "download_concurrency", "download_chunk_bytes"}
+        missing = [key for key in cls.__annotations__ if key not in optional and raw.get(key) in (None, "")]
         if missing:
             raise ConfigError("미설정 필수 항목: " + ", ".join(missing))
         unknown = set(raw) - set(cls.__annotations__)
@@ -59,9 +67,9 @@ class Config:
                 raise ConfigError(f"{key}: 절대 경로가 필요합니다")
         sqlite_path = Path(raw["sqlite_path"])
         if sqlite_path.exists() and sqlite_path.is_dir():
-            raise ConfigError("sqlite_path: 폴더가 아니라 SQLite 파일 경로가 필요합니다 (예: C:\\backup-state\\backup.sqlite)")
+            raise ConfigError("sqlite_path: 폴더가 아니라 SQLite 파일 경로가 필요합니다 (예: /volume1/backup-state/backup.sqlite)")
         root = Path(raw["backup_root"]).resolve()
-        if sqlite_path.resolve().is_relative_to(root):
+        if is_path_within(sqlite_path.resolve(), root):
             raise ConfigError("SQLite는 백업 마운트 외부의 실제 로컬 디스크에 두세요")
         marker = raw["mount_marker_name"]
         if marker in (".", "..") or any(c in marker for c in '/\\:'):
@@ -73,6 +81,10 @@ class Config:
             raise ConfigError("retention_days: 양의 정수 또는 null")
         if raw["retention_policy"] == "expire_after_days" and days is None:
             raise ConfigError("expire_after_days에는 retention_days가 필요합니다")
+        if not 1 <= raw["download_concurrency"] <= 16:
+            raise ConfigError("download_concurrency: 1 이상 16 이하의 정수가 필요합니다")
+        if not 64 * 1024 <= raw["download_chunk_bytes"] <= 64 * 1024 * 1024:
+            raise ConfigError("download_chunk_bytes: 65536 이상 67108864 이하의 정수가 필요합니다")
         if raw["special_item_policy"] not in ("report", "exclude"):
             raise ConfigError("special_item_policy: report 또는 exclude")
         if raw["guest_account_policy"] not in ("include", "exclude"):
@@ -80,7 +92,4 @@ class Config:
         return cls(**raw)
 
     def secret(self):
-        value = os.environ.get(self.client_secret_env)
-        if not value:
-            raise ConfigError("지정한 client_secret_env 환경 변수에 인증 비밀값이 없습니다")
-        return value
+        return self.client_secret

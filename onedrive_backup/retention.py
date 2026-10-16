@@ -1,9 +1,13 @@
 """Resumable age-based disposal. No recursive deletion or source-side writes."""
 import json
+import logging
 import re
 import time
 
 from .storage import StorageError, digest
+
+
+log = logging.getLogger(__name__)
 
 
 def tag(item):
@@ -24,7 +28,9 @@ class Retention:
         for row in self.db.all("SELECT rowid,* FROM objects ORDER BY created DESC,rowid DESC"):
             groups.setdefault((row["drive_id"], row["item_id"]), []).append(row)
         protected = set()
-        for rows in groups.values():
+        total = len(groups)
+        last_progress = 0.0
+        for index, rows in enumerate(groups.values(), 1):
             protected.add(rows[0]["object_id"])
             for row in rows:
                 try:
@@ -38,6 +44,11 @@ class Retention:
             else:
                 # No verified replacement: do not discard any potentially recoverable copy.
                 protected.update(row["object_id"] for row in rows)
+            now = time.monotonic()
+            if index == total or now - last_progress >= 1.0:
+                log.info("보존본 검사 진행 files=%s/%s percent=%.1f%%",
+                         index, total, index * 100.0 / total)
+                last_progress = now
         # The current pointer is also protected if imported timestamps are out of order.
         protected.update(r["object_id"] for r in self.db.all("SELECT object_id FROM items WHERE object_id IS NOT NULL"))
         # Keep source versions while a visible copy is current or an update/cleanup is unfinished.
@@ -49,8 +60,8 @@ class Retention:
         protected.update(r["object_id"] for r in self.db.all("SELECT object_id FROM browse_cleanup"))
         return protected
 
-    def candidates(self, now):
-        protected = self.protected_objects()
+    def candidates(self, now, protected=None):
+        protected = self.protected_objects() if protected is None else protected
         pending = {r["resource_id"]: dict(r) for r in self.db.all("SELECT * FROM purge_jobs WHERE state='pending'")
                    if r["kind"] != "object" or r["resource_id"] not in protected}
         if self.config.retention_policy == "keep_all":
@@ -91,12 +102,14 @@ class Retention:
     def prune(self, *, dry_run=False, now=None):
         self.storage.check(check_space=False)
         now = time.time() if now is None else now
-        candidates = self.candidates(now)
+        protected = self.protected_objects()
+        candidates = self.candidates(now, protected)
+        log.info("보존 정책 검사 완료 protected=%s candidates=%s", len(protected), len(candidates))
         if dry_run:
             return {"dry_run": True, "count": len(candidates),
                     "candidates": [{k: r[k] for k in ("resource_id", "kind", "relative_path")} for r in candidates]}
         with self.db.transaction() as conn:
-            for object_id in self.protected_objects():
+            for object_id in protected:
                 conn.execute("UPDATE purge_jobs SET state='cancelled',error='minimum_one_version' WHERE resource_id=? AND state='pending'",
                              (object_id,))
             for row in candidates:
@@ -106,7 +119,10 @@ class Retention:
                     WHERE purge_jobs.state='cancelled'""",
                              (row["resource_id"], row["kind"], row["relative_path"], row["manifest_path"], now))
         completed, failed = 0, 0
-        for row in self.db.all("SELECT * FROM purge_jobs WHERE state='pending'"):
+        pending_rows = self.db.all("SELECT * FROM purge_jobs WHERE state='pending'")
+        total = len(pending_rows)
+        last_progress = 0.0
+        for index, row in enumerate(pending_rows, 1):
             try:
                 # Both paths are validated before deleting either file, including on resume.
                 resource = row["resource_id"]
@@ -139,4 +155,9 @@ class Retention:
                 with self.db.transaction() as conn:
                     conn.execute("UPDATE purge_jobs SET error=? WHERE resource_id=?", (type(exc).__name__, row["resource_id"]))
                 failed += 1
+            progress_time = time.monotonic()
+            if index == total or progress_time - last_progress >= 1.0:
+                log.info("보존 기간 폐기 진행 items=%s/%s completed=%s failed=%s percent=%.1f%%",
+                         index, total, completed, failed, index * 100.0 / total)
+                last_progress = progress_time
         return {"dry_run": False, "completed": completed, "failed": failed}

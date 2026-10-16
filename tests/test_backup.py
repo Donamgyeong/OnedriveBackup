@@ -1,17 +1,20 @@
 import io
 import json
+import sqlite3
 import tempfile
+import threading
 import unittest
 import argparse
 from dataclasses import asdict, replace
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from onedrive_backup.config import Config, ConfigError
 from onedrive_backup.cli import execute
 from onedrive_backup.db import Database, encode
 from onedrive_backup.engine import Engine
-from onedrive_backup.graph import GraphClient, GraphError
+from onedrive_backup.graph import GraphClient, GraphError, safe_http_error_code
 from onedrive_backup.storage import ProcessLock, Storage, StorageError
 from onedrive_backup.retention import Retention
 from onedrive_backup.browse import BrowsePublisher, safe_name
@@ -91,6 +94,57 @@ class BackupTest(unittest.TestCase):
         self.scan([self.graph.current], "delta2")
         self.engine.process_jobs()
         self.assertEqual(self.db.one("SELECT COUNT(*) FROM objects")[0], 2)
+
+    def test_download_jobs_run_with_bounded_concurrency(self):
+        class ParallelGraph:
+            def __init__(self):
+                self.barrier = threading.Barrier(2)
+                self.lock = threading.Lock()
+                self.active = 0
+                self.max_active = 0
+
+            def metadata(self, drive_id, item_id):
+                item = file_item("v1", item_id + ".txt")
+                item["id"] = item_id
+                return item
+
+            def download(self, item):
+                with self.lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                try:
+                    self.barrier.wait(timeout=5)
+                    return io.BytesIO(b"hello")
+                finally:
+                    with self.lock:
+                        self.active -= 1
+
+        with self.db.transaction() as conn:
+            for item_id in ("parallel1", "parallel2"):
+                item = file_item("v1", item_id + ".txt")
+                item["id"] = item_id
+                conn.execute("INSERT INTO items(drive_id,item_id,payload,deleted) VALUES (?,?,?,0)",
+                             ("drive1", item_id, encode(item)))
+                self.db.queue("drive1", item_id)
+        graph = ParallelGraph()
+        cfg = replace(self.cfg, download_concurrency=2)
+        with self.assertLogs("onedrive_backup.engine", level="INFO") as captured:
+            Engine(cfg, self.db, graph, Storage(cfg)).process_jobs()
+        self.assertEqual(graph.max_active, 2)
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM objects")[0], 2)
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM jobs")[0], 0)
+        output = "\n".join(captured.output)
+        self.assertIn("파일 동기화 시작 files=2 bytes=10", output)
+        self.assertIn("files=2/2 success=2 failed=0 bytes=10/10 percent=100.0%", output)
+
+    def test_download_does_not_check_mount_for_every_chunk(self):
+        cfg = replace(self.cfg, download_chunk_bytes=2)
+        storage = Storage(cfg)
+        chunks = []
+        with patch.object(storage, "check", wraps=storage.check) as checked:
+            storage.put(io.BytesIO(b"hello"), 5, progress=chunks.append)
+        self.assertEqual(checked.call_count, 2)
+        self.assertEqual(chunks, [2, 2, 1])
 
     def test_page_resume_keeps_old_cursor_until_jobs_commit(self):
         self.graph.responses = [{"value": [ROOT], "@odata.nextLink": "page2"}, GraphError(503)]
@@ -189,6 +243,40 @@ class BackupTest(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "SQLite 파일 경로"):
             Config.load(path)
 
+    def test_client_secret_is_loaded_directly_from_config(self):
+        path = Path(self.temp.name) / "config.json"
+        values = asdict(self.cfg)
+        values["client_secret"] = "secret-in-config"
+        path.write_text(json.dumps(values), encoding="utf-8")
+        self.assertEqual(Config.load(path).secret(), "secret-in-config")
+
+    def test_old_config_gets_download_defaults(self):
+        path = Path(self.temp.name) / "config.json"
+        values = asdict(self.cfg)
+        del values["download_concurrency"]
+        del values["download_chunk_bytes"]
+        path.write_text(json.dumps(values), encoding="utf-8")
+        loaded = Config.load(path)
+        self.assertEqual(loaded.download_concurrency, 4)
+        self.assertEqual(loaded.download_chunk_bytes, 8 * 1024 * 1024)
+
+    def test_existing_database_adds_browse_signature_columns(self):
+        path = Path(self.temp.name) / "legacy.sqlite"
+        connection = sqlite3.connect(str(path))
+        connection.execute("""CREATE TABLE browse_files (
+            drive_id TEXT NOT NULL, item_id TEXT NOT NULL, relative_path TEXT,
+            object_id TEXT, sha256 TEXT, pending TEXT, error TEXT,
+            PRIMARY KEY(drive_id,item_id))""")
+        connection.commit()
+        connection.close()
+        database = Database(str(path), "tenant", self.mount)
+        try:
+            columns = {row["name"] for row in database.all("PRAGMA table_info(browse_files)")}
+            self.assertIn("size", columns)
+            self.assertIn("mtime_ns", columns)
+        finally:
+            database.close()
+
     def test_untrusted_delta_link_cannot_receive_credentials(self):
         with self.assertRaises(GraphError):
             GraphClient(self.cfg).get("https://attacker.invalid/v1.0/users")
@@ -198,6 +286,49 @@ class BackupTest(unittest.TestCase):
         with patch.object(client, "_open", return_value=io.BytesIO()) as opened:
             client.download({"@microsoft.graph.downloadUrl": "https://files.example.test/document"})
             self.assertIsNone(opened.call_args.args[0].get_header("Authorization"))
+
+    def test_graph_error_extracts_only_safe_code(self):
+        error = HTTPError("https://graph.microsoft.com", 403, "forbidden", {},
+                          io.BytesIO(b'{"error":{"code":"accessDenied","message":"private detail"}}'))
+        try:
+            self.assertEqual(safe_http_error_code(error), "accessDenied")
+        finally:
+            error.close()
+
+    def test_graph_error_recognizes_unprovisioned_onedrive(self):
+        error = HTTPError("https://graph.microsoft.com", 400, "bad request", {}, io.BytesIO(
+            b'{"error":{"code":"BadRequest","message":"Unable to retrieve user\\u0027s mysite URL."}}'))
+        try:
+            self.assertEqual(safe_http_error_code(error), "onedrive_not_provisioned")
+        finally:
+            error.close()
+
+    def test_discovery_treats_missing_onedrive_as_expected(self):
+        class MissingDriveGraph:
+            def pages(self, url):
+                if url.startswith("/users?"):
+                    yield {"value": [{"id": "user1", "displayName": "No Drive", "userType": "Member"}]}
+                    return
+                raise GraphError(404, "itemNotFound")
+
+        self.engine.graph = MissingDriveGraph()
+        with self.assertLogs("onedrive_backup.engine", level="INFO") as captured:
+            self.assertEqual(self.engine.discover(), 0)
+        self.assertEqual(self.db.one("SELECT status FROM accounts WHERE user_id='user1'")[0], "no_drive")
+        self.assertIn("status=404 code=itemNotFound", "\n".join(captured.output))
+
+    def test_discovery_logs_graph_status_and_code(self):
+        class DeniedDriveGraph:
+            def pages(self, url):
+                if url.startswith("/users?"):
+                    yield {"value": [{"id": "user1", "displayName": "Denied", "userType": "Member"}]}
+                    return
+                raise GraphError(403, "accessDenied")
+
+        self.engine.graph = DeniedDriveGraph()
+        with self.assertLogs("onedrive_backup.engine", level="ERROR") as captured:
+            self.assertEqual(self.engine.discover(), 1)
+        self.assertIn("status=403 code=accessDenied", "\n".join(captured.output))
 
     def test_lock_prevents_duplicate_process(self):
         with ProcessLock(self.cfg.sqlite_path + ".lock"):
@@ -246,12 +377,23 @@ class BackupTest(unittest.TestCase):
         pages = lambda url: iter([{"value": [{"id": "user1"}]}] if url.startswith("/users?") else
                                  [{"value": [{"id": "drive1", "driveType": "business"}]}])
         self.graph.responses = [{"value": [ROOT, file_item()], "@odata.deltaLink": "delta1"}]
-        with patch.object(self.graph, "pages", side_effect=pages, create=True):
+        with patch.object(self.graph, "pages", side_effect=pages, create=True), \
+                self.assertLogs(level="INFO") as captured:
             report = self.engine.run()
         self.assertEqual(report["status"], "success")
         self.assertEqual(report["browse"]["published"], 1)
         self.assertEqual(self.view_path().read_bytes(), b"hello")
         self.assertEqual(len(list((self.mount / "catalogs").glob("*.sqlite"))), 1)
+        output = "\n".join(captured.output)
+        self.assertIn("작업 단계 시작 stage=retention", output)
+        self.assertIn("작업 단계 시작 stage=user_discovery", output)
+        self.assertIn("드라이브 변경 확정 진행 drive=drive1 items=2/2 percent=100.0%", output)
+        self.assertIn("드라이브 동기화 진행 drives=1/1 percent=100.0%", output)
+        self.assertIn("백업 파일 검사 진행", output)
+        self.assertIn("파일 동기화 진행 files=1/1", output)
+        self.assertIn("탐색기 보기 동기화 진행 files=1/1", output)
+        self.assertIn("작업 단계 완료 stage=catalog_snapshot", output)
+        self.assertIn("백업 실행 완료", output)
 
     def test_restart_recovers_running_jobs(self):
         self.scan([ROOT, file_item()])
@@ -490,12 +632,26 @@ class BackupTest(unittest.TestCase):
     def test_browse_existing_backup_is_readable_without_graph(self):
         self.first_backup()
         before = self.graph.download_count
-        result = self.browse().sync()
+        with self.assertLogs("onedrive_backup.browse", level="INFO") as captured:
+            result = self.browse().sync()
         self.assertEqual(result["failed"], 0)
+        self.assertIn("files=1/1 published=1 failed=0 percent=100.0%", "\n".join(captured.output))
         self.assertEqual(self.view_path().name, "document.txt")
         self.assertEqual(self.view_path().read_bytes(), b"hello")
         self.assertEqual(self.graph.download_count, before)
-        self.assertEqual(self.browse().sync()["published"], 0)
+        with patch("onedrive_backup.browse.digest", side_effect=AssertionError("unexpected rehash")):
+            self.assertEqual(self.browse().sync()["published"], 0)
+
+    def test_browse_account_folder_uses_display_name_instead_of_email(self):
+        with self.db.transaction() as conn:
+            conn.execute("INSERT INTO accounts VALUES (?,?,?,?)",
+                         ("user1", json.dumps({"displayName": "홍길동", "userPrincipalName": "hong@example.com"}),
+                          "active", 100))
+        self.first_backup()
+        self.assertEqual(self.browse().sync()["failed"], 0)
+        account_folder = self.view_path().relative_to(self.mount / "browse").parts[0]
+        self.assertTrue(account_folder.startswith("홍길동__"))
+        self.assertNotIn("hong@example.com", account_folder)
 
     def test_browse_update_keeps_version_objects(self):
         self.first_backup()

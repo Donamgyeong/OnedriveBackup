@@ -251,7 +251,8 @@ operations:
   total_file_count_and_size:
   largest_file_size:
   daily_change_volume:
-  download_concurrency:
+  download_concurrency: 4
+  download_chunk_bytes: 8388608
   bandwidth_limit:
   retry_limits:
   queue_and_staging_limits:

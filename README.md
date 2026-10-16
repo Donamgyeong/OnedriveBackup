@@ -1,6 +1,10 @@
 # OneDrive 중앙화 증분 백업
 
-Python 3.11 이상과 표준 라이브러리만 사용하는 초기 구현이다. SQLite에 변경 조회 커서와 영속 작업 큐를 기록하고, 회사 사용자별 OneDrive 파일을 중앙화 솔루션의 마운트 경로에 저장한다. 상세 배경은 [개념 설계](CONCEPT_DESIGN.md)를 참고한다.
+Python 3.8 이상과 표준 라이브러리만 사용하는 초기 구현이다. SQLite에 변경 조회 커서와 영속 작업 큐를 기록하고, 회사 사용자별 OneDrive 파일을 중앙화 솔루션의 마운트 경로에 저장한다. 상세 배경은 [개념 설계](CONCEPT_DESIGN.md)를 참고한다.
+
+사용자 PC에 Python을 설치하지 않는 Windows 배포도 지원한다. 개발 PC에서 `build.ps1`을 실행하면 버전이 포함된 Windows 배포 ZIP이 생성된다. 배포 및 설치 절차는 [Python 없는 Windows 배포 안내](DISTRIBUTION.md)를 참고한다. PyInstaller는 빌드할 때만 사용하며 배포 프로그램의 런타임 의존성은 아니다.
+
+Synology NAS에서는 Python 3.8과 SQLite 3.24.0 이상을 확인한 뒤 소스로 실행한다. DSM 작업 스케줄러 등록과 마운트 점검 절차는 [Synology NAS 배포 안내](SYNOLOGY.md)를 참고한다. Python 3.8은 보안 지원이 종료된 버전이므로 NAS의 방화벽과 패키지 업데이트 정책으로 실행 환경을 제한해야 한다.
 
 ## 실행 준비
 
@@ -14,10 +18,10 @@ python -m onedrive_backup --config config.json validate
 | 설정 | 입력할 내용 |
 |---|---|
 | tenant_id / client_id | Entra 테넌트 ID / 등록 앱 ID |
-| client_secret_env | 클라이언트 비밀값이 들어 있는 **환경 변수 이름** |
+| client_secret | Entra 앱의 클라이언트 비밀값 |
 | authority_url | 해당 클라우드의 인증 기본 URL; 공용 클라우드 예: `https://login.microsoftonline.com` |
 | graph_url | Graph v1.0 기본 URL; 공용 클라우드 예: `https://graph.microsoft.com/v1.0` |
-| sqlite_path | 실제 로컬 디스크의 SQLite 절대 **파일** 경로. 예: `C:\\backup-state\\backup.sqlite` (폴더 경로는 사용할 수 없음) |
+| sqlite_path | 실제 로컬 디스크의 SQLite 절대 **파일** 경로. 예: Windows `C:\\backup-state\\backup.sqlite`, Synology `/volume1/onedrive-backup/state/backup.sqlite` (폴더 경로는 사용할 수 없음) |
 | backup_root | 미리 마운트되어 있는 대상의 절대 경로 |
 | mount_marker_name / mount_marker_value | 대상 루트에 미리 준비한 UTF-8 식별 파일의 이름 / 내용 |
 | backup_interval_seconds | 반복 실행 완료 후 다음 실행까지 대기할 초 |
@@ -25,12 +29,16 @@ python -m onedrive_backup --config config.json validate
 | max_attempts | 파일 작업 최대 시도 횟수 |
 | retry_base_seconds | 지수 백오프의 기본 초 |
 | http_timeout_seconds / max_http_attempts | HTTP 타임아웃 초 / 요청 최대 시도 횟수 |
+| download_concurrency | 동시 다운로드 수. 기본 4, 허용 범위 1~16 |
+| download_chunk_bytes | 다운로드·복사 버퍼 크기. 기본 8388608(8 MiB) |
 | retention_policy | `keep_all`: 계속 보존 / `expire_after_days`: 최신 1개를 남기고 기간이 지난 이전 버전 폐기 |
 | retention_days | 보존 일수(양의 정수). `expire_after_days` 선택 시 필수, `keep_all`에서는 null 가능 |
 | special_item_policy | `report`: 특수 항목을 실패로 보고 / `exclude`: 명시적으로 제외 |
 | guest_account_policy | `include` 또는 `exclude` |
 
-앱 인증은 현재 client credentials + 환경 변수의 client secret을 구현했다. 앱에는 사용 API에 맞는 `User.Read.All`, `Files.Read.All` application 권한과 관리자 동의가 필요하다. 인증서·관리 ID 인증은 아직 구현하지 않았다. 비밀값을 JSON 파일에 직접 저장하지 않는다.
+앱 인증은 client credentials 방식이며 `client_secret`을 `config.json`에서 직접 읽는다. 앱에는 사용 API에 맞는 `User.Read.All`, `Files.Read.All` application 권한과 관리자 동의가 필요하다. 인증서·관리 ID 인증은 아직 구현하지 않았다. `config.json`은 Git에서 제외되지만 평문 비밀값을 포함하므로 운영 서비스 계정과 관리자만 읽을 수 있도록 운영체제 파일 권한을 제한해야 한다. 로그와 SQLite에는 비밀값을 기록하지 않는다.
+
+계정 드라이브 조회 로그는 응답 본문이나 URL을 남기지 않고 HTTP 상태와 안전한 Graph 오류 코드만 표시한다. OneDrive가 생성되지 않은 계정의 404 또는 알려진 MySite 미프로비저닝 응답은 `no_drive`로 기록하고 전체 실행 실패 수에는 포함하지 않는다. `status=403 code=accessDenied`가 표시되면 앱의 `Files.Read.All` application 권한과 관리자 동의를 확인한다.
 
 식별 파일은 운영자가 실제 중앙화 마운트를 확인한 뒤 별도로 생성한다. 프로그램은 이 파일을 생성하지 않으며, 내용이 일치하지 않으면 쓰기를 차단한다. 서비스 계정에서 마운트를 볼 수 있어야 한다. `validate`는 설정 형식만 확인하고 인증·권한·마운트는 검사하지 않는다.
 
@@ -64,14 +72,18 @@ python -m onedrive_backup --config config.json list --drive-id <DRIVE_ID> --item
 python -m onedrive_backup --config config.json restore --object-id <OBJECT_ID> --output <ABSOLUTE_FILE_PATH>
 ```
 
-종료 코드는 0=정상, 1=실행 실패 또는 부분 실패, 2=설정/인자 오류, 130=사용자 중단이다. 반복 모드는 고정 시각 스케줄이 아니라 실행 완료 기준 간격이다. Windows 서비스 등록, 알림 전송과 로그 회전은 운영 환경이 정해진 뒤 연결한다.
+종료 코드는 0=정상, 1=실행 실패 또는 부분 실패, 2=설정/인자 오류, 130=사용자 중단이다. 반복 모드는 고정 시각 스케줄이 아니라 실행 완료 기준 간격이다. Synology에서는 DSM 작업 스케줄러로 `run`을 주기 실행할 수 있다. Windows 서비스 등록, 알림 전송과 로그 회전은 운영 환경이 정해진 뒤 연결한다.
 
 ## 저장과 증분 처리
 
 - 모든 사용자 페이지와 사용자 드라이브 페이지를 조회한다. business 유형의 사용자 드라이브를 대상으로 한다. 비활성 사용자도 게스트 정책 외 별도 필터 없이 탐색한다. 삭제된 사용자 복구 API 및 SharePoint 팀 사이트 별도 탐색은 미구현이다.
 - 초기 delta 전체 열거 후 변경분만 조회한다. 내용 태그가 같으면 이름·폴더 변경만 DB에 반영한다. 변경된 파일은 전체 내용을 내려받는다.
 - delta 페이지를 DB에 보관하고 끝까지 받은 뒤 마지막 항목 상태로 정규화한다. 작업 큐와 새 delta 커서를 하나의 트랜잭션으로 확정한다.
-- 다운로드 작업은 순차 실행한다. 다운로드 전후 원본 태그, 파일 크기, 대상 읽기 SHA-256을 검증한다. HTTP 제한 응답은 Retry-After를 존중하고 일시 오류를 재시도한다.
+- 다운로드 작업은 설정된 동시성 범위에서 병렬 실행하되 SQLite 갱신은 메인 스레드에서 순차 처리한다. 다운로드 전후 원본 태그, 파일 크기, 대상 읽기 SHA-256을 검증한다. HTTP 제한 응답은 Retry-After를 존중하고 일시 오류를 재시도한다.
+- 실행 중에는 보존 정책 검사, 사용자·OneDrive 검색, 드라이브 변경 조회, 누락 백업 검사, 파일 다운로드, 탐색기 보기 게시, DB 카탈로그 저장 등 현재 작업 단계를 콘솔에 표시한다. 총량을 아는 단계는 처리 수와 백분율을 함께 출력한다. Microsoft Graph가 총 사용자 수를 주지 않는 검색 구간은 `percent=unknown`으로 표시한다.
+- 드라이브의 마지막 delta 페이지를 받은 뒤에는 누적 항목을 SQLite에 확정하는 진행률을 별도로 표시한다. 기존 항목과 백업 객체를 일괄 조회하고 삭제된 폴더의 하위 계층을 한 번만 순회하여 대규모 드라이브의 확정 시간을 줄인다.
+- 다운로드 중에는 전체 대상 파일 수와 바이트, 성공·실패 수, 백분율을 표시한다. 큰 파일 전송 중에는 약 1초 간격으로 갱신하며 각 파일 완료 시에도 출력한다. 이어지는 `browse` 갱신은 파일 수 기준 진행률을 별도로 표시한다. Graph 요청 재시도 시에는 상태 코드, 재시도 횟수와 대기 시간을 표시한다.
+- 로그는 기본적으로 표준 오류(stderr), 명령 결과 JSON은 표준 출력(stdout)에 기록된다. 하나의 파일로 저장하려면 `OneDriveBackup ... run >> backup.log 2>&1`처럼 두 스트림을 합친다.
 - SQLite는 단일 프로세스 잠금, WAL, FULL 동기화를 사용한다. 실제 로컬 디스크 여부는 운영자가 확인해야 한다. 동일 저장소에 서로 다른 DB를 가진 여러 실행기를 동시에 배포하는 구성은 지원하지 않는다.
 - 실행 중단 시 수집 페이지와 미완료 작업에서 재개한다. 성공 파일에 대한 DB 기록 직전 중단되면 재다운로드될 수 있으나 기존 정상 파일을 덮어쓰지 않는다.
 
@@ -87,7 +99,7 @@ python -m onedrive_backup --config config.json restore --object-id <OBJECT_ID> -
 
 `browse`는 탐색기에서 원래 파일명과 확장자로 직접 열 수 있는 최신 백업 복사본이다. `run`/`serve`는 백업 처리 후 자동으로 갱신한다. 이미 저장된 `.bin` 백업도 `browse` 명령 또는 다음 백업 실행에서 변환해 보여 주며, 기존 버전 저장소를 이동하거나 삭제하지 않는다. 과거 버전은 기존 `list`와 `restore`로 조회·복원한다.
 
-계정별·드라이브별로 구분하고 원본 폴더 계층을 따른다. 계정과 폴더에는 충돌 방지를 위한 짧은 ID를 붙인다. 일반 파일명과 확장자는 유지하며, 대소문자 충돌·금지 문자·예약어·너무 긴 이름에는 ID를 붙이거나 길이를 줄인다. 매우 긴 전체 경로는 `browse/_long_paths/<계정ID>/<드라이브ID>/<파일ID>/<파일명>`에 배치한다. 원래 경로는 DB와 manifest에 남는다.
+계정 폴더는 Microsoft 365의 사용자 표시 이름(`displayName`)으로 만들고 원본 폴더 계층을 따른다. 사용자 이메일은 폴더명에 사용하지 않는다. 동명이인과 폴더명 충돌을 막기 위해 계정과 폴더에는 짧은 ID를 붙인다. 표시 이름이 없으면 사용자 ID를 사용한다. 일반 파일명과 확장자는 유지하며, 대소문자 충돌·금지 문자·예약어·너무 긴 이름에는 ID를 붙이거나 길이를 줄인다. 매우 긴 전체 경로는 `browse/_long_paths/<계정ID>/<드라이브ID>/<파일ID>/<파일명>`에 배치한다. 원래 경로는 DB와 manifest에 남는다.
 
 OneDrive에서 이름·폴더가 바뀌면 다음 실행에서 새 위치에 복사본을 만든 후 이전 위치의 프로그램 소유 복사본을 정리한다. 원본에서 삭제된 파일은 `deleted` 아래로 이동하여 마지막 백업을 계속 열람할 수 있다. 새로운 내용 백업이 실패하면 이전에 성공한 백업 내용이 표시된다. 비어 있는 폴더와 이동 후 빈 폴더는 별도 정리하지 않는다.
 
@@ -105,7 +117,7 @@ OneDrive에서 이름·폴더가 바뀌면 다음 실행에서 새 위치에 복
 
 원본 삭제 자체로 백업을 삭제하지 않는다. `expire_after_days`에서도 파일마다 마지막 백업 1개는 기간과 관계없이 보존한다. 원본이 삭제된 파일에도 같은 규칙을 적용한다. 다운로드 전에 삭제된 항목의 대기 작업은 명시적인 실패로 남는다. 애초 조회되지 않은 중간 생성·삭제와 중간 편집 버전을 보존하지 못하며, 드라이브 전체의 동일 시점 스냅샷도 보장하지 않는다.
 
-중단·검증 실패로 생긴 미등록 객체와 부분 파일은 자동 삭제하지 않는다. 실패 작업은 횟수 제한 후 중지하며 운영자가 원인을 해결하고 재시도할 수 있다. 등록된 백업 객체·manifest·DB 스냅샷은 아래 보존 정책으로 정리하며, 미등록 실패 잔여 파일 정리는 별도 구현 대상이다. 매우 큰 조직에서는 최종 delta 정규화 트랜잭션, 사용자 목록 보관, 순차 다운로드의 처리량 측정이 필요하다.
+중단·검증 실패로 생긴 미등록 객체와 부분 파일은 자동 삭제하지 않는다. 실패 작업은 횟수 제한 후 중지하며 운영자가 원인을 해결하고 재시도할 수 있다. 등록된 백업 객체·manifest·DB 스냅샷은 아래 보존 정책으로 정리하며, 미등록 실패 잔여 파일 정리는 별도 구현 대상이다. 매우 큰 조직에서는 최종 delta 정규화 트랜잭션, 사용자 목록 보관, 적정 다운로드 동시성 측정이 필요하다.
 
 DB 유실 시 서비스를 중지하고 검증한 최신 `catalogs` 스냅샷을 실제 로컬 SQLite 경로에 복사한 뒤 재개한다. 기존 DB의 WAL/SHM 파일이 섞이지 않는 새 경로를 사용한다. 설정의 테넌트와 백업 루트는 스냅샷 값과 일치해야 한다. 스냅샷 이후의 객체는 manifest로 확인할 수 있지만 자동 DB 재구성 명령은 아직 없다.
 
@@ -130,6 +142,7 @@ DB 유실 시 서비스를 중지하고 검증한 최신 `catalogs` 스냅샷을
 ## 검증
 
 ```powershell
+python tools/check_py38_compat.py
 python -m unittest discover -s tests -v
 python -m compileall -q onedrive_backup tests
 ```
