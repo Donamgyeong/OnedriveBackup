@@ -20,6 +20,7 @@ from .browse import BrowsePublisher
 def parser():
     result = argparse.ArgumentParser(description="OneDrive → 중앙화 마운트 증분 백업")
     result.add_argument("--config", default="config.json")
+    result.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate", help="설정 검증; API와 저장소 쓰기 없음")
     commands.add_parser("run", help="한 번 실행")
@@ -40,7 +41,14 @@ def parser():
 
 
 def execute(args, cfg, db, storage):
-    engine = Engine(cfg, db, GraphClient(cfg), storage)
+    graph = GraphClient(cfg)
+    try:
+        return _execute(args, cfg, db, storage, Engine(cfg, db, graph, storage))
+    finally:
+        graph.close()
+
+
+def _execute(args, cfg, db, storage, engine):
     if args.command in ("run", "serve"):
         cfg.secret()
         while True:
@@ -113,7 +121,7 @@ def execute(args, cfg, db, storage):
 
 def main(argv=None):
     args = parser().parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
     try:
         cfg = Config.load(args.config)
         if args.command == "validate":

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 $ErrorActionPreference = "Stop"
@@ -7,7 +7,7 @@ $buildRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot "build\synology"))
 $allowedBuildRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot "build"))
 $stageRoot = Join-Path $buildRoot "OneDriveBackup"
 $distRoot = Join-Path $projectRoot "dist"
-$releaseFile = "OneDriveBackup-0.10.0-synology-source.zip"
+$releaseFile = "OneDriveBackup-0.13.0-synology-source.zip"
 $zipPath = Join-Path $distRoot $releaseFile
 
 if (-not $buildRoot.StartsWith($allowedBuildRoot + [IO.Path]::DirectorySeparatorChar,
@@ -24,10 +24,13 @@ New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
 
 Copy-Item -LiteralPath (Join-Path $projectRoot "onedrive_backup") -Destination $stageRoot -Recurse
 Copy-Item -LiteralPath (Join-Path $projectRoot "synology") -Destination $stageRoot -Recurse
+Copy-Item -LiteralPath (Join-Path $projectRoot "tools") -Destination $stageRoot -Recurse
 Copy-Item -LiteralPath (Join-Path $projectRoot "config.example.json") -Destination $stageRoot
 Copy-Item -LiteralPath (Join-Path $projectRoot "pyproject.toml") -Destination $stageRoot
 Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination $stageRoot
 Copy-Item -LiteralPath (Join-Path $projectRoot "SYNOLOGY.md") -Destination $stageRoot
+Copy-Item -LiteralPath (Join-Path $projectRoot "SCALABILITY.md") -Destination $stageRoot
+Copy-Item -LiteralPath (Join-Path $projectRoot "PERFORMANCE.md") -Destination $stageRoot
 
 Get-ChildItem -LiteralPath $stageRoot -Filter "__pycache__" -Directory -Recurse |
     Remove-Item -Recurse -Force

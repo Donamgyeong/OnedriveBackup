@@ -3,7 +3,8 @@ import logging
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from http.client import HTTPException
 
 from .db import encode
@@ -11,9 +12,28 @@ from .graph import GraphError, segment
 from .storage import StorageError, digest, storage_error_detail
 from .retention import Retention
 from .browse import BrowsePublisher
+from .scheduling import DownloadQueue, size_class
 
 
 log = logging.getLogger(__name__)
+
+ELIGIBLE_JOBS_SQL = """ FROM jobs j JOIN drives d ON j.drive_id=d.drive_id
+    WHERE j.state='pending' AND j.retry_at<=? AND d.status='active'
+    AND j.job_id<=? AND NOT EXISTS (SELECT 1 FROM items i JOIN purge_jobs p ON p.resource_id=i.object_id
+        WHERE i.drive_id=j.drive_id AND i.item_id=j.item_id AND p.state='pending')"""
+
+
+class DownloadReader:
+    """Classify failures while reading the HTTP body separately from disk errors."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def read(self, size=-1):
+        try:
+            return self.stream.read(size)
+        except (OSError, HTTPException):
+            raise GraphError(0, "download_stream_interrupted") from None
 
 
 class DownloadProgress:
@@ -32,6 +52,15 @@ class DownloadProgress:
 
     def start(self):
         log.info("파일 동기화 시작 files=%s bytes=%s", self.total_files, self.total_bytes)
+
+    def heartbeat(self):
+        with self.lock:
+            now = time.monotonic()
+            if now - self.last_report < self.interval_seconds:
+                return
+            self.last_report = now
+            values = self._values()
+        self._report(values)
 
     def advance(self, count):
         should_report = False
@@ -52,7 +81,10 @@ class DownloadProgress:
                 self.successful_files += 1
             else:
                 self.failed_files += 1
-            self.last_report = time.monotonic()
+            now = time.monotonic()
+            if successful and self.processed_files != self.total_files and now - self.last_report < self.interval_seconds:
+                return
+            self.last_report = now
             values = self._values()
         self._report(values)
 
@@ -68,7 +100,9 @@ class DownloadProgress:
 
     @staticmethod
     def _report(values):
-        log.info("파일 동기화 진행 files=%s/%s success=%s failed=%s bytes=%s/%s percent=%.1f%%", *values)
+        processed, total = values[:2]
+        log.info("파일 동기화 진행 files=%s/%s success=%s failed=%s bytes=%s/%s percent=%.1f%% file_percent=%.3f%% byte_percent=%.3f%%",
+                 *values, processed * 100.0 / total if total else 100.0, values[-1])
 
 
 def content_tag(item):
@@ -95,6 +129,7 @@ def kind(item):
 class Engine:
     def __init__(self, config, db, graph, storage):
         self.config, self.db, self.graph, self.storage = config, db, graph, storage
+        self.metadata_seconds = 0.0
 
     def discover(self):
         # Only declare disappeared accounts after a complete successful enumeration.
@@ -307,18 +342,19 @@ class Engine:
                     conn.execute("INSERT OR IGNORE INTO browse_jobs VALUES (?,?)", (drive_id, missing["item_id"]))
             conn.execute("""UPDATE items SET deleted=1 WHERE drive_id=? AND item_id NOT IN
                 (SELECT item_id FROM scan_items WHERE drive_id=?)""", (drive_id, drive_id))
-        rows = conn.execute("SELECT * FROM scan_items WHERE drive_id=?", (drive_id,)).fetchall()
-        existing = {row["item_id"]: row for row in conn.execute("""SELECT
-            i.item_id,i.payload,i.deleted,i.object_id,o.payload AS object_payload
-            FROM scan_items s JOIN items i ON i.drive_id=s.drive_id AND i.item_id=s.item_id
+        rows = conn.execute("""SELECT s.*,i.item_id AS old_item_id,i.payload AS old_payload,
+            i.deleted AS old_deleted,i.object_id AS old_object_id,o.payload AS object_payload
+            FROM scan_items s LEFT JOIN items i ON i.drive_id=s.drive_id AND i.item_id=s.item_id
             LEFT JOIN objects o ON o.object_id=i.object_id
-            WHERE s.drive_id=?""", (drive_id,)).fetchall()}
-        total = len(rows)
+            WHERE s.drive_id=?""", (drive_id,))
+        total = self.db.one("SELECT COUNT(*) FROM scan_items WHERE drive_id=?", (drive_id,))[0]
         last_progress = 0.0
         log.info("드라이브 변경 확정 시작 drive=%s items=%s", drive_id, total)
         for index, row in enumerate(rows, 1):
             item = json.loads(row["payload"])
-            old = existing.get(item["id"])
+            old = ({"payload": row["old_payload"], "deleted": row["old_deleted"],
+                    "object_id": row["old_object_id"], "object_payload": row["object_payload"]}
+                   if row["old_item_id"] is not None else None)
             if kind(item) == "deleted" and old:
                 item = {**json.loads(old["payload"]), **item}
             encoded_item = encode(item)
@@ -357,7 +393,7 @@ class Engine:
                 last_progress = now
         children = {}
         if hierarchy_changes or deletion_roots:
-            entries = self.db.all("SELECT item_id,payload FROM items WHERE drive_id=? AND deleted=0", (drive_id,))
+            entries = conn.execute("SELECT item_id,payload FROM items WHERE drive_id=? AND deleted=0", (drive_id,))
             for entry in entries:
                 parent_id = json.loads(entry["payload"]).get("parentReference", {}).get("id")
                 children.setdefault(parent_id, []).append(entry["item_id"])
@@ -502,20 +538,46 @@ class Engine:
                 checkpoint_repairs = []
         return repaired
 
-    def _download_content(self, job, before, progress=None):
+    def _download_content(self, job, before, progress=None, defer_verification=False):
         started = time.perf_counter()
+        timings = {}
         if kind(before) != "file":
             raise ValueError("source_not_regular_file")
         expected = content_tag(before)
         if not expected:
             raise ValueError("source_version_tag_missing")
-        with self.graph.download(before) as stream:
-            object_id, relative, sha256 = self.storage.put(stream, before["size"], progress=progress)
+        try:
+            stream = self.graph.download(before)
+        except (OSError, HTTPException):
+            raise GraphError(0, "download_connection_failed") from None
+        timings["connection"] = time.perf_counter() - started
+        with stream:
+            try:
+                object_id, relative, sha256 = self.storage.put(DownloadReader(stream), before["size"], progress=progress, timings=timings,
+                                                             verify=not defer_verification)
+            except StorageError as exc:
+                if str(exc) in ("download_size_mismatch", "download_larger_than_metadata"):
+                    raise GraphError(0, "download_size_changed_or_truncated") from None
+                raise
         return {"object_id": object_id, "relative": relative, "sha256": sha256,
                 "size": before["size"], "expected": expected,
+                "timings": timings,
                 "elapsed": max(time.perf_counter() - started, 0.000001)}
 
-    def _finalize_download(self, job, user_id, original_parts, before, result, after):
+    def _verify_content(self, result):
+        started = time.perf_counter()
+        try:
+            self.storage.verify(result["relative"], result["size"], result["sha256"])
+        except Exception:
+            try:
+                self.storage.remove(result["relative"])
+            except (OSError, StorageError):
+                log.warning("검증 실패 객체 정리 보류 object_id=%s", result["object_id"])
+            raise
+        result["timings"]["readback"] = time.perf_counter() - started
+        return result
+
+    def _prepare_download(self, job, user_id, original_parts, before, result, after):
         drive_id, item_id = job["drive_id"], job["item_id"]
         object_id, relative, sha256 = result["object_id"], result["relative"], result["sha256"]
         expected = result["expected"]
@@ -534,9 +596,17 @@ class Engine:
         if site_source:
             manifest.update({"source_kind": "sharepoint", "site_id": site_source["site_id"],
                              "library": json.loads(site_source["profile"]), "user_id": None})
-        self.storage.manifest(object_id, manifest)
-        result.update({"metadata": after, "created": created})
+        result.update({"metadata": after, "created": created, "manifest": manifest})
         return result
+
+    def _write_manifest(self, result):
+        started = time.perf_counter()
+        self.storage.manifest(result["object_id"], result.pop("manifest"))
+        result.setdefault("timings", {})["manifest"] = time.perf_counter() - started
+        return result
+
+    def _finalize_download(self, job, user_id, original_parts, before, result, after):
+        return self._write_manifest(self._prepare_download(job, user_id, original_parts, before, result, after))
 
     def _download_job(self, job, user_id, original_parts, progress=None):
         before = self.graph.metadata(job["drive_id"], job["item_id"])
@@ -563,18 +633,31 @@ class Engine:
             self._commit_backup_on(conn, job, result)
 
     def _metadata_for_jobs(self, jobs):
+        started = time.perf_counter()
+        try:
+            return self._metadata_results(jobs)
+        finally:
+            self.metadata_seconds += time.perf_counter() - started
+
+    def _metadata_results(self, jobs):
+        if not jobs:
+            return []
         identities = [(job["drive_id"], job["item_id"]) for job in jobs]
         batch_method = getattr(self.graph, "metadata_batch", None)
         if batch_method:
             try:
                 return batch_method(identities)
-            except (GraphError, OSError, HTTPException, ValueError, KeyError) as exc:
+            except (OSError, HTTPException):
+                return [GraphError(0, "metadata_network_error")] * len(jobs)
+            except (GraphError, ValueError, KeyError) as exc:
                 return [exc] * len(jobs)
         results = []
         for drive_id, item_id in identities:
             try:
                 results.append(self.graph.metadata(drive_id, item_id))
-            except (GraphError, OSError, HTTPException, ValueError, KeyError) as exc:
+            except (OSError, HTTPException):
+                results.append(GraphError(0, "metadata_network_error"))
+            except (GraphError, ValueError, KeyError) as exc:
                 results.append(exc)
         return results
 
@@ -586,6 +669,9 @@ class Engine:
         return result
 
     def _record_job_failure(self, job, exc):
+        governor = getattr(self.graph, "governor", None)
+        if governor and isinstance(exc, GraphError) and exc.status == 0:
+            governor.network_failure()
         attempts = job["attempts"] + 1
         error = str(exc) if isinstance(exc, (GraphError, StorageError)) else type(exc).__name__
         with self.db.transaction() as conn:
@@ -595,101 +681,246 @@ class Engine:
                           error, job["job_id"]))
         log.error("파일 처리 실패 drive=%s item=%s error=%s", job["drive_id"], job["item_id"], error)
 
+    def _download_totals(self, args):
+        # Stream one joined query: never materialize hundreds of thousands of jobs
+        # or run one extra SQLite query per file just to calculate progress totals.
+        total_files, total_bytes = 0, 0
+        last_report = time.monotonic()
+        self.db.conn.execute("DROP TABLE IF EXISTS temp.download_schedule")
+        self.db.conn.execute("""CREATE TEMP TABLE download_schedule (
+            category INTEGER NOT NULL,job_id INTEGER NOT NULL,size INTEGER NOT NULL,
+            PRIMARY KEY(category,job_id)) WITHOUT ROWID""")
+        totals_sql = """SELECT j.job_id,(SELECT i.payload FROM items i
+            WHERE i.drive_id=j.drive_id AND i.item_id=j.item_id) AS payload""" + ELIGIBLE_JOBS_SQL
+        staged = []
+        for row in self.db.conn.execute(totals_sql, args):
+            total_files += 1
+            size = json.loads(row["payload"]).get("size", 0) if row["payload"] else 0
+            if type(size) is int and size > 0:
+                total_bytes += size
+            else:
+                size = 0
+            staged.append((size_class(size), row["job_id"], size))
+            if len(staged) == 1000:
+                self.db.conn.executemany("INSERT INTO download_schedule VALUES (?,?,?)", staged)
+                staged.clear()
+            if time.monotonic() - last_report >= 5:
+                log.info("다운로드 작업 집계 진행 files=%s bytes=%s", total_files, total_bytes)
+                last_report = time.monotonic()
+        self.db.conn.executemany("INSERT INTO download_schedule VALUES (?,?,?)", staged)
+        self.db.conn.commit()
+        return total_files, total_bytes
+
+    def _download_batches(self, args, workers):
+        cursor = 0
+        while True:
+            rows = self.db.all("SELECT j.*" + ELIGIBLE_JOBS_SQL +
+                               " AND j.job_id>? ORDER BY j.job_id LIMIT 256", args + (cursor,))
+            if not rows:
+                return
+            cursor = rows[-1]["job_id"]
+            for offset in range(0, len(rows), workers):
+                yield [dict(row) for row in rows[offset:offset + workers]]
+
     def process_jobs(self):
-        jobs = [dict(row) for row in self.db.all("""SELECT j.* FROM jobs j JOIN drives d ON j.drive_id=d.drive_id
-            WHERE j.state='pending' AND j.retry_at<=? AND d.status='active'
-            AND NOT EXISTS (SELECT 1 FROM items i JOIN purge_jobs p ON p.resource_id=i.object_id
-                WHERE i.drive_id=j.drive_id AND i.item_id=j.item_id AND p.state='pending')
-            ORDER BY j.job_id""", (time.time(),))]
-        workers = min(self.config.download_concurrency, len(jobs))
+        horizon = self.db.one("SELECT COALESCE(MAX(job_id),0) FROM jobs")[0]
+        total_files, total_bytes = self._download_totals((time.time(), horizon))
+        governor = getattr(self.graph, "governor", None)
+        ceiling = self.config.download_concurrency_max if governor else self.config.download_concurrency
+        workers = min(max(ceiling, self.config.download_concurrency), total_files)
         if not workers:
             log.info("파일 다운로드 대상 없음")
             return
-        total_bytes = 0
-        for job in jobs:
-            item = self.db.one("SELECT payload FROM items WHERE drive_id=? AND item_id=?",
-                               (job["drive_id"], job["item_id"]))
-            if item:
-                size = json.loads(item["payload"]).get("size", 0)
-                if type(size) is int and size > 0:
-                    total_bytes += size
-        progress = DownloadProgress(len(jobs), total_bytes)
+        verifier_count = self.config.verification_concurrency
+        capacity = workers + 2 * verifier_count
+        progress = DownloadProgress(total_files, total_bytes)
         progress.start()
         self.storage.check()
-        # Worker threads perform network and unique-file I/O only. SQLite remains on this thread.
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            for offset in range(0, len(jobs), workers):
-                batch = jobs[offset:offset + workers]
-                prepared = []
-                fatal = None
-                for job in batch:
-                    try:
-                        drive = self.db.one("SELECT user_id FROM drives WHERE drive_id=?", (job["drive_id"],))
-                        original_parts = self.original_parts(job["drive_id"], job["item_id"])
-                        prepared.append((job, drive["user_id"], original_parts))
-                    except (GraphError, StorageError, OSError, HTTPException, ValueError, KeyError) as exc:
-                        self._record_job_failure(job, exc)
-                        progress.finish_file(False)
-                        if isinstance(exc, (StorageError, OSError)):
-                            fatal = exc
+        self.storage.path("manifests").mkdir(parents=True, exist_ok=True)
+        queue = DownloadQueue(self.db)
+        ready, outstanding = deque(), {}
+        exhausted, fatal = False, None
+        metrics_started = time.perf_counter()
+        observation_started = metrics_started
+        saturated_seconds = pressure_seconds = 0.0
+        last_stage_report = metrics_started
+        completed_bytes = completed_files = last_received = 0
+        metadata_seconds = 0.0
+        totals = dict.fromkeys(("connection", "network_read", "disk_write", "readback", "manifest"), 0.0)
+        # Only this coordinator accesses SQLite. All inter-stage queues are
+        # bounded by capacity; queued entries hold metadata, never file contents.
+        def entries():
+            return list(ready) + [entry for phase, batch, started in outstanding.values() for entry in batch]
+
+        def failure(entry, exc):
+            nonlocal fatal
+            self._record_job_failure(entry[0][0], exc)
+            progress.finish_file(False)
+            result = entry[2]
+            if result is not None:
+                # These IDs belong only to an uncommitted object from this run.
+                try:
+                    self.storage.remove(result["relative"])
+                    self.storage.remove("manifests/" + result["object_id"] + ".json")
+                except (OSError, StorageError):
+                    log.warning("미완료 객체 정리 보류 object_id=%s", result["object_id"])
+            if isinstance(exc, (StorageError, OSError)) and fatal is None:
+                fatal = exc
+
+        def restore(entry):
+            with self.db.transaction() as conn:
+                conn.execute("UPDATE jobs SET state='pending' WHERE job_id=?", (entry[0][0]["job_id"],))
+
+        with ThreadPoolExecutor(max_workers=workers) as network, \
+                ThreadPoolExecutor(max_workers=verifier_count) as verification, \
+                ThreadPoolExecutor(max_workers=1) as metadata:
+            while not exhausted or outstanding or ready:
+                target = min(workers, governor.limit()) if governor else workers
+                active = entries()
+                network_entries = [entry for phase, batch, _ in outstanding.values()
+                                   if phase in ("before", "content") for entry in batch]
+                backlog = [entry for phase, batch, _ in outstanding.values()
+                           if phase in ("verify", "after", "manifest") for entry in batch]
+                backlog_bytes = sum(entry[2]["size"] for entry in backlog)
+                pressure = (len(backlog) >= 2 * verifier_count or
+                            backlog_bytes >= self.config.verification_backlog_bytes)
+                observation_now = time.perf_counter()
+                observation_elapsed = observation_now - observation_started
+                observation_started = observation_now
+                if sum(len(batch) for phase, batch, _ in outstanding.values() if phase == "content") >= target:
+                    saturated_seconds += observation_elapsed
+                if pressure:
+                    pressure_seconds += observation_elapsed
+                # Stop admitting new streams when verification is behind. Already
+                # streaming files can finish, so the byte bound may overshoot by
+                # at most the currently active streams (including one huge file).
+                if fatal is not None:
+                    exhausted = True
+                    while ready:
+                        restore(ready.popleft())
+                if not pressure and fatal is None:
+                    content_count = sum(len(batch) for phase, batch, _ in outstanding.values() if phase == "content")
+                    while ready and content_count < target:
+                        entry = ready.popleft()
+                        context, before, _ = entry
+                        if time.monotonic() - before["_backup_fetched_at"] >= 60:
+                            task = metadata.submit(self._metadata_results, [context[0]])
+                            outstanding[task] = ("before", [entry], time.perf_counter())
+                            continue
+                        future = network.submit(self._download_content, context[0], before, progress.advance, True)
+                        outstanding[future] = ("content", [entry], time.perf_counter())
+                        content_count += 1
+                    # Prefetch a bounded metadata batch while current streams
+                    # are still busy, so a finished stream can be replaced at once.
+                    free = min(target - len(ready) - sum(len(batch) for phase, batch, _ in outstanding.values()
+                                                        if phase == "before"), capacity - len(active)) if not exhausted else 0
+                    prepared = []
+                    for _ in range(max(0, free)):
+                        job = queue.pop([entry[0][0] for entry in active] + [entry[0][0] for entry in prepared])
+                        if job is None:
+                            exhausted = True
                             break
-                if prepared:
-                    with self.db.transaction() as conn:
-                        conn.executemany("UPDATE jobs SET state='running' WHERE job_id=?",
-                                         ((entry[0]["job_id"],) for entry in prepared))
-                before_values = self._metadata_for_jobs([entry[0] for entry in prepared])
-                submitted = []
-                for context, before in zip(prepared, before_values):
-                    job, user_id, original_parts = context
-                    if isinstance(before, Exception):
-                        self._record_job_failure(job, before)
-                        progress.finish_file(False)
+                        try:
+                            drive = self.db.one("SELECT user_id FROM drives WHERE drive_id=?", (job["drive_id"],))
+                            context = (job, drive["user_id"], self.original_parts(job["drive_id"], job["item_id"]))
+                            prepared.append((context, None, None))
+                        except (GraphError, StorageError, OSError, HTTPException, ValueError, KeyError) as exc:
+                            failure(((job, None, None), None, None), exc)
+                            if fatal:
+                                break
+                    if prepared:
+                        with self.db.transaction() as conn:
+                            conn.executemany("UPDATE jobs SET state='running' WHERE job_id=?",
+                                             ((entry[0][0]["job_id"],) for entry in prepared))
+                        future = metadata.submit(self._metadata_results, [entry[0][0] for entry in prepared])
+                        outstanding[future] = ("before", prepared, time.perf_counter())
+                done = set()
+                if outstanding:
+                    done, _ = wait(outstanding, timeout=1, return_when=FIRST_COMPLETED)
+                after_batch, completed = [], []
+                for future in done:
+                    phase, batch, operation_started = outstanding.pop(future)
+                    try:
+                        value = future.result()
+                    except (GraphError, StorageError, OSError, HTTPException, ValueError, KeyError) as exc:
+                        for entry in batch:
+                            failure(entry, exc)
                         continue
-                    try:
-                        future = executor.submit(self._download_content, job, before, progress.advance)
-                        submitted.append((context, before, future))
-                    except (GraphError, StorageError, OSError, HTTPException, ValueError, KeyError) as exc:
-                        self._record_job_failure(job, exc)
-                        progress.finish_file(False)
-                        if isinstance(exc, (StorageError, OSError)) and fatal is None:
-                            fatal = exc
-                downloaded = []
-                for context, before, future in submitted:
-                    job, user_id, original_parts = context
-                    try:
-                        downloaded.append((context, before, future.result()))
-                    except (GraphError, StorageError, OSError, HTTPException, ValueError, KeyError) as exc:
-                        self._record_job_failure(job, exc)
-                        progress.finish_file(False)
-                        if isinstance(exc, (StorageError, OSError)) and fatal is None:
-                            fatal = exc
-                after_values = self._metadata_for_jobs([entry[0][0] for entry in downloaded])
-                completed = []
-                for downloaded_entry, after in zip(downloaded, after_values):
-                    context, before, result = downloaded_entry
-                    job, user_id, original_parts = context
-                    try:
-                        if isinstance(after, Exception):
-                            raise after
-                        result = self._finalize_download(job, user_id, original_parts, before, result, after)
-                        completed.append((job, result))
-                    except (GraphError, StorageError, OSError, HTTPException, ValueError, KeyError) as exc:
-                        self._record_job_failure(job, exc)
-                        progress.finish_file(False)
-                        if isinstance(exc, (StorageError, OSError)) and fatal is None:
-                            fatal = exc
+                    if phase in ("before", "after"):
+                        metadata_seconds += time.perf_counter() - operation_started
+                        for entry, item in zip(batch, value):
+                            context, before, result = entry
+                            if isinstance(item, Exception):
+                                failure(entry, item)
+                            elif phase == "before":
+                                if fatal is not None:
+                                    restore(entry)
+                                else:
+                                    item["_backup_fetched_at"] = time.monotonic()
+                                    ready.append((context, item, None))
+                            else:
+                                try:
+                                    result = self._prepare_download(context[0], context[1], context[2], before, result, item)
+                                    task = verification.submit(self._write_manifest, result)
+                                    outstanding[task] = ("manifest", [entry], time.perf_counter())
+                                except (GraphError, StorageError, OSError, HTTPException, ValueError, KeyError) as exc:
+                                    failure(entry, exc)
+                    elif phase == "content":
+                        entry = (batch[0][0], batch[0][1], value)
+                        task = verification.submit(self._verify_content, value)
+                        outstanding[task] = ("verify", [entry], time.perf_counter())
+                    elif phase == "verify":
+                        after_batch.extend(batch)
+                    elif phase == "manifest":
+                        completed.append((batch[0][0][0], value))
+                if after_batch:
+                    for offset in range(0, len(after_batch), 20):
+                        batch = after_batch[offset:offset + 20]
+                        future = metadata.submit(self._metadata_results, [entry[0][0] for entry in batch])
+                        outstanding[future] = ("after", batch, time.perf_counter())
                 if completed:
                     with self.db.transaction() as conn:
                         for job, result in completed:
                             self._commit_backup_on(conn, job, result)
                     for job, result in completed:
-                        rate = result["size"] / result["elapsed"] / (1024 * 1024)
-                        log.info("파일 백업 완료 drive=%s item=%s bytes=%s seconds=%.3f MiB/s=%.2f",
-                                 job["drive_id"], job["item_id"], result["size"], result["elapsed"], rate)
                         progress.finish_file(True)
+                        completed_bytes += result["size"]
+                        completed_files += 1
+                        for key in totals:
+                            totals[key] += result["timings"].get(key, 0.0)
+                        if governor:
+                            governor.success()
+                progress.heartbeat()
+                now = time.perf_counter()
+                if now - last_stage_report >= 5:
+                    phases = {phase: sum(len(batch) for current, batch, _ in outstanding.values() if current == phase)
+                              for phase in ("before", "content", "verify", "after", "manifest")}
+                    log.info("다운로드 작업 상태 metadata_before=%s stream=%s readback=%s metadata_after=%s manifest=%s ready=%s",
+                             phases["before"], phases["content"], phases["verify"], phases["after"], phases["manifest"], len(ready))
+                    last_stage_report = now
+                elapsed = max(now - metrics_started, 0.000001)
+                if elapsed >= 30 or (exhausted and not outstanding and not ready):
+                    with progress.lock:
+                        received = progress.transferred_bytes
+                    received_rate = (received - last_received) / elapsed
+                    validated_rate = completed_bytes / elapsed
+                    log.info("다운로드 성능 received_MiB_s=%.3f completed_MiB_s=%.3f files_s=%.2f concurrency=%s active=%s verification_jobs=%s verification_bytes=%s metadata_s=%.2f connection_s=%.2f network_read_s=%.2f disk_write_s=%.2f readback_s=%.2f manifest_s=%.2f",
+                             received_rate / 1024 ** 2, validated_rate / 1024 ** 2, completed_files / elapsed,
+                             target, len(network_entries), len(backlog), backlog_bytes, metadata_seconds,
+                             totals["connection"], totals["network_read"], totals["disk_write"], totals["readback"], totals["manifest"])
+                    if governor and elapsed >= 30:
+                        governor.observe(received_rate, validated_rate,
+                                         not exhausted and saturated_seconds >= elapsed * 0.5,
+                                         disk_pressure=pressure_seconds >= elapsed * 0.5)
+                    metrics_started, last_received = now, received
+                    completed_bytes = completed_files = 0
+                    metadata_seconds = 0.0
+                    totals = dict.fromkeys(totals, 0.0)
+                    saturated_seconds = pressure_seconds = 0.0
                 if fatal is not None:
-                    # Storage failures stop later batches without discarding completed work.
-                    raise fatal
+                    exhausted = True
+            if fatal is not None:
+                raise fatal
 
     def run(self):
         self.storage.check(check_space=False)
@@ -740,7 +971,8 @@ class Engine:
             errors += browse["failed"]
         except (GraphError, StorageError, OSError, ValueError, KeyError) as exc:
             fatal = True
-            log.error("실행 실패 type=%s", storage_error_detail(exc) if isinstance(exc, StorageError) else type(exc).__name__)
+            detail = storage_error_detail(exc) if isinstance(exc, StorageError) else str(exc) if isinstance(exc, GraphError) else type(exc).__name__
+            log.error("실행 실패 type=%s", detail)
         remaining = self.db.one("SELECT COUNT(*) AS n FROM jobs")["n"]
         status = "failed" if fatal else ("partial" if errors or remaining else "success")
         with self.db.transaction() as conn:

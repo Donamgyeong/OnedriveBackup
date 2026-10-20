@@ -1,15 +1,20 @@
 """Small stdlib Graph client; credentials never follow download redirects."""
 import json
 import logging
+import math
 import random
 import re
 import threading
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from .throttle import RequestGovernor
+from .transport import PersistentHTTPSOpener
 
 
 log = logging.getLogger(__name__)
@@ -21,6 +26,66 @@ class GraphError(RuntimeError):
         self.code = code
         # Never include response bodies, tokens, or signed URLs in exception text.
         super().__init__(f"Graph HTTP {status}: {code}")
+
+
+class ResumableBody:
+    """Resume transient stream failures within a run, using the same signed URL.
+
+    Only a validated 206 response may be appended. The engine still verifies
+    source version/size after download and reads the destination back in full.
+    """
+    def __init__(self, client, metadata):
+        self.client = client
+        self.url = metadata["@microsoft.graph.downloadUrl"]
+        self.size = metadata["size"]
+        self.offset = self.retries = 0
+        self.stream = self._open()
+        self.etag = getattr(self.stream, "headers", {}).get("ETag")
+
+    def _open(self):
+        headers = {"Accept-Encoding": "identity"}
+        if self.offset:
+            headers["Range"] = "bytes={}-".format(self.offset)
+            if self.etag:
+                headers["If-Range"] = self.etag
+        response = self.client._open(Request(self.url, headers=headers), self.client.download_opener)
+        if self.offset:
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+            if (response.getcode() != 206 or not match or int(match[1]) != self.offset or
+                    int(match[3]) != self.size or not self.offset <= int(match[2]) < self.size):
+                response.close()
+                raise GraphError(0, "download_resume_range_rejected")
+        elif response.getcode() != 200:
+            response.close()
+            raise GraphError(0, "download_unexpected_partial_response")
+        return response
+
+    def read(self, size=-1):
+        while True:
+            try:
+                block = self.stream.read(size)
+                if not block and self.offset < self.size:
+                    raise OSError("truncated_stream")
+                self.offset += len(block)
+                return block
+            except (OSError, HTTPException):
+                self.stream.close()
+                if self.retries >= self.client.config.max_http_attempts - 1:
+                    raise GraphError(0, "download_stream_retry_exhausted") from None
+                self.retries += 1
+                self.client.governor.network_failure()
+                log.warning("다운로드 연결 재개 offset=%s total=%s attempt=%s", self.offset, self.size, self.retries)
+                time.sleep(self.client.delay(self.retries - 1))
+                self.stream = self._open()
+
+    def close(self):
+        self.stream.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -73,16 +138,30 @@ def safe_error_payload_code(payload):
 class GraphClient:
     def __init__(self, config):
         self.config = config
-        self.opener = build_opener(NoRedirect())
-        self.download_opener = build_opener(HTTPSRedirect())
+        self.opener = PersistentHTTPSOpener(build_opener(NoRedirect()))
+        self.download_opener = PersistentHTTPSOpener(build_opener(HTTPSRedirect()), allow_redirects=True)
+        self.governor = RequestGovernor(config.download_concurrency, config.download_concurrency_max,
+                                        config.request_units_per_second)
         self.token = None
         self.expires = 0
         self.token_lock = threading.Lock()
 
+    @staticmethod
+    def _read_json(response, stage):
+        try:
+            payload = json.load(response)
+        except (ValueError, UnicodeError):
+            raise GraphError(0, "invalid_{}_json_response".format(stage)) from None
+        if not isinstance(payload, dict):
+            raise GraphError(0, "invalid_{}_json_shape".format(stage))
+        return payload
+
     def delay(self, attempt, retry_after=None):
         if retry_after:
             try:
-                return max(0, float(retry_after))
+                seconds = float(retry_after)
+                if math.isfinite(seconds):
+                    return max(0, seconds)
             except ValueError:
                 try:
                     return max(0, (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds())
@@ -91,20 +170,28 @@ class GraphClient:
         return min(300, self.config.retry_base_seconds * 2 ** min(attempt, 10)) + random.random()
 
     def _open(self, request, opener=None):
+        request.add_header("User-Agent", "OneDriveCentralBackup/0.13.0")
         for attempt in range(self.config.max_http_attempts):
+            self.governor.wait(getattr(request, "throttle_cost", 1))
             try:
-                return (opener or self.opener).open(request, timeout=self.config.http_timeout_seconds)
+                response = (opener or self.opener).open(request, timeout=self.config.http_timeout_seconds)
+                self.governor.headers(getattr(response, "headers", None))
+                return response
             except HTTPError as exc:
                 status, retry_after = exc.code, exc.headers.get("Retry-After")
                 error_code = safe_http_error_code(exc)
                 exc.close()
+                wait_seconds = self.delay(attempt, retry_after)
+                if status in (429, 503):
+                    self.governor.backoff(wait_seconds)
                 if status not in (429, 500, 502, 503, 504) or attempt + 1 == self.config.max_http_attempts:
                     raise GraphError(status, error_code) from None
-                wait_seconds = self.delay(attempt, retry_after)
                 log.warning("Graph 요청 재시도 status=%s code=%s attempt=%s/%s wait_seconds=%.1f",
                             status, error_code, attempt + 1, self.config.max_http_attempts, wait_seconds)
-                time.sleep(wait_seconds)
-            except (URLError, TimeoutError, OSError):
+                if status not in (429, 503):
+                    time.sleep(wait_seconds)
+            except (URLError, TimeoutError, OSError, HTTPException):
+                self.governor.network_failure()
                 if attempt + 1 == self.config.max_http_attempts:
                     raise GraphError(0, "network_error") from None
                 wait_seconds = self.delay(attempt)
@@ -124,7 +211,7 @@ class GraphClient:
                               "scope": cfg.graph_url.rsplit("/", 1)[0] + "/.default"}).encode()
             url = cfg.authority_url + "/" + segment(cfg.tenant_id) + "/oauth2/v2.0/token"
             with self._open(Request(url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})) as response:
-                payload = json.load(response)
+                payload = self._read_json(response, "token")
             self.token = payload["access_token"]
             self.expires = time.time() + max(0, int(payload["expires_in"]) - 120)
             return self.token
@@ -139,7 +226,7 @@ class GraphClient:
             request = Request(url, headers={"Authorization": "Bearer " + self.access_token()})
             try:
                 with self._open(request) as response:
-                    return json.load(response)
+                    return self._read_json(response, "metadata")
             except GraphError as exc:
                 if exc.status != 401 or attempt:
                     raise
@@ -157,9 +244,10 @@ class GraphClient:
                 "Authorization": "Bearer " + self.access_token(),
                 "Content-Type": "application/json",
             })
+            request.throttle_cost = max(1, len(payload.get("requests", [])))
             try:
                 with self._open(request) as response:
-                    return json.load(response)
+                    return self._read_json(response, "batch")
             except GraphError as exc:
                 if exc.status != 401 or attempt:
                     raise
@@ -176,10 +264,12 @@ class GraphClient:
 
     def metadata_batch(self, identities):
         """Fetch up to 20 driveItem resources while preserving per-item failures."""
+        if not identities:
+            return []
         if len(identities) > 20:
             raise ValueError("graph_batch_limit_exceeded")
         if identities:
-            log.info("Graph 메타데이터 배치 조회 시작 items=%s", len(identities))
+            log.debug("Graph 메타데이터 배치 조회 시작 items=%s", len(identities))
         results = [None] * len(identities)
         pending = {str(index): (index, drive_id, item_id)
                    for index, (drive_id, item_id) in enumerate(identities)}
@@ -195,6 +285,7 @@ class GraphClient:
                          if isinstance(response, dict)}
             retry = {}
             retry_after = None
+            throttled = False
             for request_id, identity in pending.items():
                 index, drive_id, item_id = identity
                 response = responses.get(request_id)
@@ -203,35 +294,38 @@ class GraphClient:
                     continue
                 status = response.get("status")
                 body = response.get("body", {})
+                self.governor.headers(response.get("headers"))
                 if isinstance(status, int) and 200 <= status < 300 and isinstance(body, dict):
                     results[index] = body
                     continue
+                if status in (429, 503):
+                    throttled = True
+                headers = response.get("headers", {})
+                if isinstance(headers, dict):
+                    value = next((v for k, v in headers.items() if str(k).casefold() == "retry-after"), None)
+                    if value is not None:
+                        retry_after = max(self.delay(attempt, str(value)), retry_after or 0)
                 if status in (429, 500, 502, 503, 504) and attempt + 1 < self.config.max_http_attempts:
                     retry[request_id] = (index, drive_id, item_id)
-                    headers = response.get("headers", {})
-                    if isinstance(headers, dict):
-                        value = next((v for k, v in headers.items() if str(k).casefold() == "retry-after"), None)
-                        if value is not None:
-                            try:
-                                retry_after = max(float(value), retry_after or 0)
-                            except (TypeError, ValueError):
-                                pass
                     continue
                 results[index] = GraphError(status if isinstance(status, int) else 0,
                                             safe_error_payload_code(body))
+            wait_seconds = self.delay(attempt, str(retry_after) if retry_after is not None else None)
+            if throttled:
+                self.governor.backoff(wait_seconds)
             if not retry:
                 break
-            wait_seconds = self.delay(attempt, str(retry_after) if retry_after is not None else None)
             log.warning("Graph 배치 요청 재시도 items=%s attempt=%s/%s wait_seconds=%.1f",
                         len(retry), attempt + 1, self.config.max_http_attempts, wait_seconds)
-            time.sleep(wait_seconds)
+            if not throttled:
+                time.sleep(wait_seconds)
             pending = retry
         for request_id, (index, _, _) in pending.items():
             if results[index] is None:
                 results[index] = GraphError(0, "batch_retry_exhausted")
         if identities:
             failed = sum(isinstance(result, Exception) for result in results)
-            log.info("Graph 메타데이터 배치 조회 완료 items=%s failed=%s", len(identities), failed)
+            log.debug("Graph 메타데이터 배치 조회 완료 items=%s failed=%s", len(identities), failed)
         return results
 
     def download(self, metadata):
@@ -239,4 +333,8 @@ class GraphClient:
         if not url or urlsplit(url).scheme != "https":
             raise GraphError(0, "download_url_missing")
         # Pre-authenticated URL: deliberately no Graph Authorization header.
-        return self._open(Request(url), self.download_opener)
+        return ResumableBody(self, metadata)
+
+    def close(self):
+        self.opener.close()
+        self.download_opener.close()

@@ -15,10 +15,14 @@
   "http_timeout_seconds": null,
   "max_http_attempts": null,
   "download_concurrency": 4,
+  "download_concurrency_max": 8,
   "download_chunk_bytes": 8388608,
   "repair_check_batch_size": 10000,
   "retention_policy": null,
   "retention_days": null,
   "special_item_policy": null,
-  "guest_account_policy": null
+  "guest_account_policy": null,
+  "verification_concurrency": 2,
+  "verification_backlog_bytes": 536870912,
+  "request_units_per_second": 0
 }

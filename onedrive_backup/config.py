@@ -35,6 +35,10 @@ class Config:
     download_concurrency: int = 4
     download_chunk_bytes: int = 8 * 1024 * 1024
     repair_check_batch_size: int = 10000
+    download_concurrency_max: int = 8
+    verification_concurrency: int = 2
+    verification_backlog_bytes: int = 512 * 1024 * 1024
+    request_units_per_second: int = 0
 
     @classmethod
     def load(cls, path):
@@ -43,7 +47,12 @@ class Config:
         raw.setdefault("download_concurrency", 4)
         raw.setdefault("download_chunk_bytes", 8 * 1024 * 1024)
         raw.setdefault("repair_check_batch_size", 10000)
-        optional = {"retention_days", "download_concurrency", "download_chunk_bytes", "repair_check_batch_size"}
+        raw.setdefault("verification_concurrency", 2)
+        raw.setdefault("verification_backlog_bytes", 512 * 1024 * 1024)
+        raw.setdefault("request_units_per_second", 0)
+        initial = raw.get("download_concurrency", 4)
+        raw.setdefault("download_concurrency_max", max(8, initial) if type(initial) is int else 8)
+        optional = {"retention_days", "download_concurrency", "download_chunk_bytes", "repair_check_batch_size", "download_concurrency_max", "verification_concurrency", "verification_backlog_bytes", "request_units_per_second"}
         missing = [key for key in cls.__annotations__ if key not in optional and raw.get(key) in (None, "")]
         if missing:
             raise ConfigError("미설정 필수 항목: " + ", ".join(missing))
@@ -57,7 +66,7 @@ class Config:
                 raise ConfigError(f"{key}: {typ.__name__} 형식이 필요합니다")
             if typ is str and not raw[key].strip():
                 raise ConfigError(f"{key}: 빈 값입니다")
-            if typ is int and raw[key] < (0 if key == "minimum_free_bytes" else 1):
+            if typ is int and raw[key] < (0 if key in ("minimum_free_bytes", "request_units_per_second") else 1):
                 raise ConfigError(f"{key}: 범위를 벗어난 값입니다")
         for key in ("authority_url", "graph_url"):
             u = urlsplit(raw[key])
@@ -85,10 +94,14 @@ class Config:
             raise ConfigError("expire_after_days에는 retention_days가 필요합니다")
         if not 1 <= raw["download_concurrency"] <= 16:
             raise ConfigError("download_concurrency: 1 이상 16 이하의 정수가 필요합니다")
+        if not raw["download_concurrency"] <= raw["download_concurrency_max"] <= 16:
+            raise ConfigError("download_concurrency_max: download_concurrency 이상 16 이하의 정수가 필요합니다")
         if not 64 * 1024 <= raw["download_chunk_bytes"] <= 64 * 1024 * 1024:
             raise ConfigError("download_chunk_bytes: 65536 이상 67108864 이하의 정수가 필요합니다")
         if not 1 <= raw["repair_check_batch_size"] <= 100000:
             raise ConfigError("repair_check_batch_size: 1 이상 100000 이하의 정수가 필요합니다")
+        if not 1 <= raw["verification_concurrency"] <= 4:
+            raise ConfigError("verification_concurrency: 1 이상 4 이하의 정수가 필요합니다")
         if raw["special_item_policy"] not in ("report", "exclude"):
             raise ConfigError("special_item_policy: report 또는 exclude")
         if raw["guest_account_policy"] not in ("include", "exclude"):

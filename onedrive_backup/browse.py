@@ -202,16 +202,31 @@ class BrowsePublisher:
         return failed
 
     def sync(self):
+        published, failed, processed, cursor = 0, 0, 0, 0
+        while True:
+            self._item_payloads.clear()
+            result = self._sync_batch(cursor)
+            published += result["published"]
+            failed += result["failed"]
+            processed += result["processed"]
+            if not result["processed"]:
+                break
+            cursor = result["cursor"]
+            log.info("탐색기 게시 체크포인트 processed=%s published=%s failed=%s", processed, published, failed)
+        self.storage.check(check_space=False)
+        failed += self.cleanup()
+        return {"published": published, "failed": failed, "path": str(self.storage.root / "browse")}
+
+    def _sync_batch(self, cursor):
         self.storage.check(check_space=False)
         failed, published = 0, 0
-        rows = self.db.all("""SELECT o.*,i.payload AS source_payload,i.deleted FROM browse_jobs j
+        rows = self.db.all("""SELECT o.*,i.payload AS source_payload,i.deleted,j.rowid AS browse_job_id FROM browse_jobs j
             CROSS JOIN items i ON i.drive_id=j.drive_id AND i.item_id=j.item_id
             CROSS JOIN objects o ON i.object_id=o.object_id WHERE NOT EXISTS
             (SELECT 1 FROM purge_jobs p WHERE p.resource_id=o.object_id AND p.state='pending')
-            ORDER BY o.drive_id,o.item_id""")
+            AND j.rowid>? ORDER BY j.rowid LIMIT 256""", (cursor,))
         if not rows:
-            failed += self.cleanup()
-            return {"published": published, "failed": failed, "path": str(self.storage.root / "browse")}
+            return {"published": 0, "failed": 0, "processed": 0, "cursor": cursor}
         reserved = {}
         for entry in self.db.all("SELECT * FROM browse_files WHERE pending IS NOT NULL"):
             identity = (entry["drive_id"], entry["item_id"])
@@ -291,5 +306,5 @@ class BrowsePublisher:
                              processed_rows, total_rows, published, failed,
                              processed_rows * 100.0 / total_rows)
                     last_progress = now
-        failed += self.cleanup()
-        return {"published": published, "failed": failed, "path": str(self.storage.root / "browse")}
+        return {"published": published, "failed": failed, "processed": len(rows),
+                "cursor": rows[-1]["browse_job_id"]}

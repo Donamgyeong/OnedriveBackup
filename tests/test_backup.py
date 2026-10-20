@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import argparse
 from dataclasses import asdict, replace
@@ -150,7 +151,9 @@ class BackupTest(unittest.TestCase):
         with self.assertLogs("onedrive_backup.engine", level="INFO") as captured:
             Engine(cfg, self.db, graph, Storage(cfg)).process_jobs()
         self.assertEqual(graph.max_active, 2)
-        self.assertEqual([len(batch) for batch in graph.metadata_batches], [2, 2])
+        self.assertEqual(len(graph.metadata_batches[0]), 2)
+        self.assertEqual(sum(len(batch) for batch in graph.metadata_batches), 4)
+        self.assertTrue(all(len(batch) <= 2 for batch in graph.metadata_batches))
         self.assertEqual(self.db.one("SELECT COUNT(*) FROM objects")[0], 2)
         self.assertEqual(self.db.one("SELECT COUNT(*) FROM jobs")[0], 0)
         output = "\n".join(captured.output)
@@ -165,6 +168,117 @@ class BackupTest(unittest.TestCase):
             storage.put(io.BytesIO(b"hello"), 5, progress=chunks.append)
         self.assertEqual(checked.call_count, 2)
         self.assertEqual(chunks, [2, 2, 1])
+
+    def test_manifest_writes_can_overlap_before_database_commit(self):
+        barrier = threading.Barrier(2)
+        original = self.storage.manifest
+        def manifest(object_id, payload):
+            barrier.wait(timeout=5)
+            original(object_id, payload)
+        with self.db.transaction() as conn:
+            for item_id in ("manifest1", "manifest2"):
+                conn.execute("INSERT INTO items(drive_id,item_id,payload) VALUES (?,?,?)",
+                             ("drive1", item_id, encode({**file_item(), "id": item_id})))
+                self.db.queue("drive1", item_id)
+        with patch.object(self.storage, "manifest", side_effect=manifest):
+            Engine(replace(self.cfg, download_concurrency=2), self.db, self.graph, self.storage).process_jobs()
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM jobs")[0], 0)
+        for row in self.db.all("SELECT object_id FROM objects"):
+            self.assertTrue(self.storage.path("manifests/" + row["object_id"] + ".json").is_file())
+
+    def test_stream_timeout_does_not_stop_later_files_or_leave_partial_object(self):
+        class Interrupted(io.BytesIO):
+            def read(self, size=-1):
+                if self.tell():
+                    raise TimeoutError("private connection details")
+                return super().read(2)
+
+        class MixedGraph(FakeGraph):
+            def metadata(self, drive_id, item_id):
+                return {**file_item(), "id": item_id}
+
+            def download(self, item):
+                return Interrupted(b"hello") if item["id"] == "f1" else io.BytesIO(b"hello")
+
+        with self.db.transaction() as conn:
+            for index in range(5):
+                item_id = "f" + str(index)
+                conn.execute("INSERT INTO items(drive_id,item_id,payload) VALUES (?,?,?)",
+                             ("drive1", item_id, encode({**file_item(), "id": item_id})))
+                self.db.queue("drive1", item_id)
+        engine = Engine(replace(self.cfg, download_concurrency=2), self.db, MixedGraph(), self.storage)
+        engine.process_jobs()
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM objects")[0], 4)
+        failed = self.db.one("SELECT * FROM jobs")
+        self.assertEqual(failed["item_id"], "f1")
+        self.assertEqual(failed["attempts"], 1)
+        self.assertEqual(failed["state"], "pending")
+        self.assertGreater(failed["retry_at"], time.time())
+        self.assertIn("download_stream_interrupted", failed["error"])
+        self.assertNotIn("private", failed["error"])
+        self.assertEqual(len(list((self.mount / "objects").rglob("*.bin"))), 4)
+        engine.graph = MixedGraph()
+        engine.graph.download = lambda item: io.BytesIO(b"hello")
+        with self.db.transaction() as conn:
+            conn.execute("UPDATE jobs SET retry_at=0")
+        engine.process_jobs()
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM jobs")[0], 0)
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM objects")[0], 5)
+
+    def test_disk_failure_still_stops_downloads(self):
+        self.scan([ROOT, file_item()])
+        with patch.object(self.storage, "put", side_effect=PermissionError("disk unavailable")):
+            with self.assertRaises(PermissionError):
+                self.engine.process_jobs()
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM objects")[0], 0)
+
+    def test_slow_first_file_does_not_hold_other_download_slots(self):
+        third_started = threading.Event()
+        class RollingGraph(FakeGraph):
+            def metadata(self, drive_id, item_id):
+                return {**file_item(), "id": item_id}
+
+            def download(self, item):
+                if item["id"] == "rolling0":
+                    if not third_started.wait(timeout=5):
+                        raise TimeoutError("third file was never scheduled")
+                elif item["id"] == "rolling2":
+                    third_started.set()
+                return io.BytesIO(b"hello")
+
+        with self.db.transaction() as conn:
+            for index in range(3):
+                item_id = "rolling" + str(index)
+                conn.execute("INSERT INTO items(drive_id,item_id,payload) VALUES (?,?,?)",
+                             ("drive1", item_id, encode({**file_item(), "id": item_id})))
+                self.db.queue("drive1", item_id)
+        Engine(replace(self.cfg, download_concurrency=2), self.db, RollingGraph(), self.storage).process_jobs()
+        self.assertTrue(third_started.is_set())
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM objects")[0], 3)
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM jobs")[0], 0)
+
+    def test_large_queue_pages_keep_totals_and_skip_future_retries(self):
+        count = 600
+        with self.db.transaction() as conn:
+            for index in range(count):
+                item_id = "large" + str(index)
+                conn.execute("INSERT INTO items(drive_id,item_id,payload) VALUES (?,?,?)",
+                             ("drive1", item_id, encode({**file_item(), "id": item_id, "size": 5 * 1024 ** 3})))
+                self.db.queue("drive1", item_id)
+        horizon = self.db.one("SELECT MAX(job_id) FROM jobs")[0]
+        args = (time.time(), horizon)
+        self.assertEqual(self.engine._download_totals(args), (count, count * 5 * 1024 ** 3))
+        seen = []
+        with patch.object(self.db, "all", wraps=self.db.all) as queried:
+            for batch in self.engine._download_batches(args, 4):
+                self.assertLessEqual(len(batch), 4)
+                seen.extend(job["job_id"] for job in batch)
+                with self.db.transaction() as conn:
+                    conn.executemany("UPDATE jobs SET retry_at=? WHERE job_id=?",
+                                     ((time.time() + 600, job["job_id"]) for job in batch))
+            self.assertTrue(all("LIMIT 256" in call.args[0] for call in queried.call_args_list))
+        self.assertEqual(len(seen), count)
+        self.assertEqual(len(set(seen)), count)
 
     def test_page_resume_keeps_old_cursor_until_jobs_commit(self):
         self.graph.responses = [{"value": [ROOT], "@odata.nextLink": "page2"}, GraphError(503)]
@@ -242,8 +356,7 @@ class BackupTest(unittest.TestCase):
     def test_short_download_not_registered(self):
         self.scan([ROOT, file_item()])
         with patch.object(self.graph, "download", return_value=io.BytesIO(b"hi")):
-            with self.assertRaises(StorageError):
-                self.engine.process_jobs()
+            self.engine.process_jobs()
         self.assertEqual(self.db.one("SELECT COUNT(*) FROM objects")[0], 0)
 
     def test_signed_url_is_not_persisted(self):
@@ -276,11 +389,27 @@ class BackupTest(unittest.TestCase):
         del values["download_concurrency"]
         del values["download_chunk_bytes"]
         del values["repair_check_batch_size"]
+        del values["download_concurrency_max"]
+        del values["verification_concurrency"]
+        del values["verification_backlog_bytes"]
+        del values["request_units_per_second"]
         path.write_text(json.dumps(values), encoding="utf-8")
         loaded = Config.load(path)
         self.assertEqual(loaded.download_concurrency, 4)
         self.assertEqual(loaded.download_chunk_bytes, 8 * 1024 * 1024)
         self.assertEqual(loaded.repair_check_batch_size, 10000)
+        self.assertEqual(loaded.download_concurrency_max, 8)
+        self.assertEqual(loaded.verification_concurrency, 2)
+        self.assertEqual(loaded.verification_backlog_bytes, 536870912)
+        self.assertEqual(loaded.request_units_per_second, 0)
+
+    def test_legacy_high_concurrency_keeps_valid_adaptive_ceiling(self):
+        path = Path(self.temp.name) / "config.json"
+        values = asdict(self.cfg)
+        values["download_concurrency"] = 16
+        del values["download_concurrency_max"]
+        path.write_text(json.dumps(values), encoding="utf-8")
+        self.assertEqual(Config.load(path).download_concurrency_max, 16)
 
     def test_existing_database_adds_browse_signature_columns(self):
         path = Path(self.temp.name) / "legacy.sqlite"
@@ -305,8 +434,12 @@ class BackupTest(unittest.TestCase):
 
     def test_download_has_no_authorization_header(self):
         client = GraphClient(self.cfg)
-        with patch.object(client, "_open", return_value=io.BytesIO()) as opened:
-            client.download({"@microsoft.graph.downloadUrl": "https://files.example.test/document"})
+        self.addCleanup(client.close)
+        response = io.BytesIO()
+        response.getcode = lambda: 200
+        response.headers = {}
+        with patch.object(client, "_open", return_value=response) as opened:
+            client.download({"size": 0, "@microsoft.graph.downloadUrl": "https://files.example.test/document"}).close()
             self.assertIsNone(opened.call_args.args[0].get_header("Authorization"))
 
     def test_graph_error_extracts_only_safe_code(self):
@@ -346,6 +479,58 @@ class BackupTest(unittest.TestCase):
     def test_graph_metadata_batch_rejects_more_than_twenty_items(self):
         with self.assertRaisesRegex(ValueError, "graph_batch_limit_exceeded"):
             GraphClient(self.cfg).metadata_batch([("drive", str(index)) for index in range(21)])
+
+    def test_batch_terminal_throttle_still_updates_shared_retry_after(self):
+        client = GraphClient(replace(self.cfg, max_http_attempts=1))
+        self.addCleanup(client.close)
+        with patch.object(client, "post_json", return_value={"responses": [
+                {"id": "0", "status": 429, "headers": {"Retry-After": "7"}}]}):
+            results = client.metadata_batch([("drive1", "file1")])
+        self.assertIsInstance(results[0], GraphError)
+        self.assertEqual(results[0].status, 429)
+        self.assertEqual(client.governor.limit(), 2)
+        self.assertGreater(client.governor.pause_until, time.monotonic() + 6)
+
+    def test_metadata_throttle_reduces_submissions_without_losing_jobs(self):
+        from onedrive_backup.throttle import RequestGovernor
+        class ControlledGraph(FakeGraph):
+            def __init__(self):
+                super().__init__()
+                self.governor = RequestGovernor(4, 8)
+                self.calls = 0
+                self.maximum_active = 0
+                self.active = 0
+                self.lock = threading.Lock()
+
+            def metadata_batch(self, identities):
+                self.calls += 1
+                if self.calls == 1:
+                    self.governor.backoff(0)
+                return [{**file_item(), "id": item_id} for _, item_id in identities]
+
+            def download(self, item):
+                with self.lock:
+                    self.active += 1
+                    self.maximum_active = max(self.maximum_active, self.active)
+                stream = io.BytesIO(b"hello")
+                original_close = stream.close
+                def close():
+                    with self.lock:
+                        self.active -= 1
+                    original_close()
+                stream.close = close
+                return stream
+        with self.db.transaction() as conn:
+            for index in range(6):
+                item_id = "controlled" + str(index)
+                conn.execute("INSERT INTO items(drive_id,item_id,payload) VALUES (?,?,?)",
+                             ("drive1", item_id, encode({**file_item(), "id": item_id})))
+                self.db.queue("drive1", item_id)
+        graph = ControlledGraph()
+        Engine(self.cfg, self.db, graph, self.storage).process_jobs()
+        self.assertLessEqual(graph.maximum_active, 2)
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM objects")[0], 6)
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM jobs")[0], 0)
 
     def test_discovery_treats_missing_onedrive_as_expected(self):
         class MissingDriveGraph:
@@ -787,6 +972,36 @@ class BackupTest(unittest.TestCase):
         account_folder = self.view_path().relative_to(self.mount / "browse").parts[0]
         self.assertTrue(account_folder.startswith("홍길동__"))
         self.assertNotIn("hong@example.com", account_folder)
+
+    def test_browse_crosses_page_boundary_and_keeps_failed_job(self):
+        self.first_backup()
+        self.browse().sync()
+        source = self.db.one("SELECT * FROM objects")
+        # Catalog-only fixtures share immutable content; each item has a unique
+        # destination. Exercise deletion from the queue while keyset paging it.
+        with self.db.transaction() as conn:
+            for number in range(258):
+                item_id = "page" + str(number)
+                object_id = format(number + 1, "032x")
+                item = {**file_item(name=item_id + ".txt"), "id": item_id}
+                conn.execute("INSERT INTO objects VALUES (?,?,?,?,?,?,?,?,?)",
+                             (object_id, "drive1", item_id, source["relative_path"], source["sha256"],
+                              source["size"], encode(item), source["created"], source["verification"]))
+                conn.execute("INSERT INTO items(drive_id,item_id,payload,object_id) VALUES (?,?,?,?)",
+                             ("drive1", item_id, encode(item), object_id))
+                conn.execute("INSERT INTO browse_jobs VALUES (?,?)", ("drive1", item_id))
+        publisher = self.browse()
+        resume = publisher.resume
+        def sometimes_locked(entry):
+            if entry["item_id"] == "page0":
+                raise PermissionError("locked")
+            return resume(entry)
+        with patch.object(publisher, "resume", side_effect=sometimes_locked):
+            report = publisher.sync()
+        self.assertEqual(report["published"], 257)
+        self.assertEqual(report["failed"], 1)
+        self.assertEqual(self.db.one("SELECT COUNT(*) FROM browse_jobs")[0], 1)
+        self.assertEqual(self.db.one("SELECT item_id FROM browse_jobs")[0], "page0")
 
     def test_browse_update_keeps_version_objects(self):
         self.first_backup()

@@ -1,14 +1,18 @@
 import hashlib
 import json
+import logging
 import os
 import shutil
 import stat
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
 from .compat import is_path_within
+
+log = logging.getLogger(__name__)
 
 
 class StorageError(RuntimeError):
@@ -47,6 +51,8 @@ class Storage:
         self.root = Path(config.backup_root).resolve()
         self._reservation_lock = threading.Lock()
         self._reserved_bytes = 0
+        self._directory_lock = threading.Lock()
+        self._created_directories = set()
 
     def check(self, expected_size=0, *, check_space=True):
         marker = self.root / self.config.mount_marker_name
@@ -72,6 +78,16 @@ class Storage:
         path = self.path(relative)
         return path.is_file() and path.stat().st_size == size
 
+    def _write_path(self, relative):
+        # Serialize first creation only. Parallel mkdir/resolve on a new shared
+        # parent can race on virtual mounts; repeated mkdir is expensive on NAS.
+        parent = relative.rsplit("/", 1)[0]
+        with self._directory_lock:
+            if parent not in self._created_directories:
+                self.path(relative).parent.mkdir(parents=True, exist_ok=True)
+                self._created_directories.add(parent)
+        return self.path(relative)
+
     def remove(self, relative):
         self.check(check_space=False)
         # Resolve and enforce containment before every individual unlink. Never recurse.
@@ -89,39 +105,65 @@ class Storage:
             with self._reservation_lock:
                 self._reserved_bytes -= size
 
-    def put(self, stream, size, progress=None):
+    def put(self, stream, size, progress=None, timings=None, verify=True):
+        timings = timings if timings is not None else {}
+        timings.update({"network_read": 0.0, "disk_write": 0.0, "readback": 0.0})
         with self.reserve(size):
             object_id = uuid.uuid4().hex
             relative = f"objects/{object_id[:2]}/{object_id}.bin"
-            path = self.path(relative)
-            path.parent.mkdir(parents=True, exist_ok=True)
+            path = self._write_path(relative)
             checksum, received = hashlib.sha256(), 0
             # Unique immutable object. Only the committed DB/manifest makes it visible.
             # No atomic rename or replacement support is required from the mount.
-            with path.open("xb") as handle:
-                while True:
-                    block = stream.read(self.config.download_chunk_bytes)
-                    if not block:
-                        break
-                    received += len(block)
-                    if received > size:
-                        raise StorageError("download_larger_than_metadata")
-                    handle.write(block)
-                    checksum.update(block)
-                    if progress:
-                        progress(len(block))
-                handle.flush()
-                os.fsync(handle.fileno())
-            if received != size:
-                raise StorageError("download_size_mismatch")
-            self.check(check_space=False)
-            if digest(path, self.config.download_chunk_bytes) != checksum.hexdigest():
-                raise StorageError("readback_checksum_mismatch")
+            owned = False
+            try:
+                with path.open("xb") as handle:
+                    owned = True
+                    while True:
+                        operation_started = time.perf_counter()
+                        block = stream.read(self.config.download_chunk_bytes)
+                        timings["network_read"] += time.perf_counter() - operation_started
+                        if not block:
+                            break
+                        received += len(block)
+                        if received > size:
+                            raise StorageError("download_larger_than_metadata")
+                        operation_started = time.perf_counter()
+                        handle.write(block)
+                        timings["disk_write"] += time.perf_counter() - operation_started
+                        checksum.update(block)
+                        if progress:
+                            progress(len(block))
+                    operation_started = time.perf_counter()
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    timings["disk_write"] += time.perf_counter() - operation_started
+                if received != size:
+                    raise StorageError("download_size_mismatch")
+                if verify:
+                    operation_started = time.perf_counter()
+                    self.verify(relative, size, checksum.hexdigest())
+                    timings["readback"] = time.perf_counter() - operation_started
+            except Exception:
+                # Only this newly created, uncommitted object may be removed.
+                # If the mount is unavailable, keep the original failure and report
+                # that a partial object remains instead of masking the cause.
+                if owned:
+                    try:
+                        self.remove(relative)
+                    except (OSError, StorageError):
+                        log.warning("미완료 객체 정리 보류 object_id=%s", object_id)
+                raise
             return object_id, relative, checksum.hexdigest()
 
+    def verify(self, relative, size, sha256):
+        self.check(check_space=False)
+        path = self.path(relative)
+        if path.stat().st_size != size or digest(path, self.config.download_chunk_bytes) != sha256:
+            raise StorageError("readback_checksum_mismatch")
+
     def manifest(self, object_id, payload):
-        path = self.path(f"manifests/{object_id}.json")
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = self._write_path(f"manifests/{object_id}.json")
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         self.check(len(encoded))
         with path.open("xb") as handle:

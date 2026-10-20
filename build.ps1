@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$Python = ".\.venv\Scripts\python.exe"
 )
@@ -36,12 +36,14 @@ try {
     $releaseDir = Join-Path $projectRoot "dist\OneDriveBackup"
     Copy-Item -LiteralPath "config.example.json" -Destination $releaseDir
     Copy-Item -LiteralPath "README.md" -Destination $releaseDir
+    Copy-Item -LiteralPath "SCALABILITY.md" -Destination $releaseDir
+    Copy-Item -LiteralPath "PERFORMANCE.md" -Destination $releaseDir
     Copy-Item -LiteralPath "DISTRIBUTION.md" -Destination (Join-Path $releaseDir "USER_GUIDE.md")
     Copy-Item -LiteralPath "packaging\RUN_ONCE.cmd" -Destination $releaseDir
     Copy-Item -LiteralPath "packaging\STATUS.cmd" -Destination $releaseDir
     Copy-Item -LiteralPath "packaging\UPDATE_BROWSE.cmd" -Destination $releaseDir
 
-    $releaseFile = "OneDriveBackup-0.10.0-win64.zip"
+    $releaseFile = "OneDriveBackup-0.13.0-win64.zip"
     $zipPath = Join-Path $projectRoot ("dist\" + $releaseFile)
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force

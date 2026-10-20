@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS runs (
  run_id INTEGER PRIMARY KEY AUTOINCREMENT, started REAL NOT NULL, finished REAL,
  status TEXT NOT NULL, summary TEXT);
 CREATE INDEX IF NOT EXISTS jobs_due ON jobs(state,retry_at);
+CREATE INDEX IF NOT EXISTS jobs_pending_id ON jobs(state,job_id);
 CREATE INDEX IF NOT EXISTS items_object ON items(object_id);
 CREATE TABLE IF NOT EXISTS expired_items (
  drive_id TEXT NOT NULL, item_id TEXT NOT NULL, content_tag TEXT,
